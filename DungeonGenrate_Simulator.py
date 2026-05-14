@@ -233,6 +233,7 @@ class Step:
     nodes: List[BSPNode]
     path: List[Tuple[int, int]]
     note: str = ""
+    extra_paths: Optional[List[Tuple[List[Tuple[int, int]], str, str]]] = None
 
 
 # -----------------------------
@@ -249,9 +250,56 @@ class DungeonGenerator:
         self.steps: List[Step] = []
         self.nodes: List[BSPNode] = []
 
-    def snapshot(self, title: str, path: Optional[List[Tuple[int, int]]] = None, note: str = "") -> None:
+    def snapshot(
+        self,
+        title: str,
+        path: Optional[List[Tuple[int, int]]] = None,
+        note: str = "",
+        extra_paths: Optional[List[Tuple[List[Tuple[int, int]], str, str]]] = None,
+    ) -> None:
         copied_grid = [row[:] for row in self.grid]
-        self.steps.append(Step(title, copied_grid, self.rooms[:], self.nodes[:], list(path or []), note))
+        copied_extra_paths = None
+        if extra_paths:
+            copied_extra_paths = [(list(candidate_path), color, label) for candidate_path, color, label in extra_paths]
+        self.steps.append(Step(title, copied_grid, self.rooms[:], self.nodes[:], list(path or []), note, copied_extra_paths))
+
+    @staticmethod
+    def extra_candidate_color(index: int) -> str:
+        # High-contrast palette for overlaying multiple EXTRA candidates.
+        palette = [
+            "#00e5ff", "#ffd60a", "#7cff6b", "#ff7ad9",
+            "#b388ff", "#ff9f1c", "#2ec4b6", "#f72585",
+            "#a7f432", "#4cc9f0", "#ff6b6b", "#caffbf",
+            "#9bf6ff", "#fdffb6", "#ffc6ff", "#bdb2ff",
+        ]
+        return palette[index % len(palette)]
+
+    @classmethod
+    def build_extra_candidate_overlays(
+        cls,
+        candidates: List[ExtraCorridorCandidate],
+        selected: Optional[ExtraCorridorCandidate] = None,
+    ) -> List[Tuple[List[Tuple[int, int]], str, str]]:
+        overlays: List[Tuple[List[Tuple[int, int]], str, str]] = []
+        selected_key = None
+        if selected is not None:
+            selected_key = (selected.src_idx, selected.dst_idx, selected.candidate_index, selected.extra_attempt_index)
+
+        color_index = 0
+        for candidate in candidates:
+            key = (candidate.src_idx, candidate.dst_idx, candidate.candidate_index, candidate.extra_attempt_index)
+            if key == selected_key:
+                continue
+            label = f"C{color_index}: R{candidate.src_idx}->{candidate.dst_idx} score={candidate.score}"
+            overlays.append((candidate.path[:], cls.extra_candidate_color(color_index), label))
+            color_index += 1
+
+        # Keep the selected candidate in the overlay list too, but reserve red for the existing current-path highlight.
+        # This lets users compare it against all other pair-best candidates while preserving the final choice.
+        if selected is not None:
+            label = f"SELECTED R{selected.src_idx}->{selected.dst_idx} score={selected.score}"
+            overlays.append((selected.path[:], "#ff3b30", label))
+        return overlays
 
     def generate(self) -> List[Step]:
         root = BSPNode(1, 1, self.s.map_width - 2, self.s.map_height - 2)
@@ -459,9 +507,11 @@ class DungeonGenerator:
                 f"centerDistSq={selected.center_dist_sq} requestedPerPair={self.s.extra_candidate_count} "
                 f"carvedExtrasSoFar={carved_count}"
             )
+            overlays = self.build_extra_candidate_overlays(pair_best_candidates, selected)
+            note += f"\nshown_candidates={max(0, len(overlays) - 1)} pair-best 후보 + selected"
             self.snapshot(
                 f"05-{attempt_index + 1:02d}. EXTRA 선택 통로 R{selected.src_idx} -> R{selected.dst_idx}",
-                selected.path, note
+                selected.path, note, extra_paths=overlays
             )
 
         if carved_count == 0:
@@ -1427,11 +1477,23 @@ class DungeonViewer(tk.Tk):
             for r in step.rooms:
                 rect_grid(r.x, r.y, r.w, r.h, "#e8f1a1", 1)
 
+        if show_path and step.extra_paths:
+            for candidate_path, color, label in step.extra_paths:
+                for x, y in set(candidate_path):
+                    if 0 <= x < w and 0 <= y < h:
+                        x0, y0 = x * cell, y * cell
+                        draw.rectangle([x0 + 1, y0 + 1, x0 + cell - 1, y0 + cell - 1], outline=color, width=max(1, min(2, cell // 3)))
+                if candidate_path and cell >= 6:
+                    lx, ly = candidate_path[0]
+                    if 0 <= lx < w and 0 <= ly < h:
+                        short_label = label.split(":", 1)[0].replace("SELECTED", "S")
+                        draw.text((lx * cell + 1, ly * cell + 1), short_label, fill=color)
+
         if show_path and step.path:
             for x, y in set(step.path):
                 if 0 <= x < w and 0 <= y < h:
                     x0, y0 = x * cell, y * cell
-                    draw.rectangle([x0, y0, x0 + cell, y0 + cell], outline="#ff3b30", width=2)
+                    draw.rectangle([x0, y0, x0 + cell, y0 + cell], outline="#ff3b30", width=max(2, min(4, cell // 2)))
 
         photo = ImageTk.PhotoImage(image)
         self._remember_cached_image(key, photo)
@@ -1470,13 +1532,18 @@ class DungeonViewer(tk.Tk):
 
         legend_x = ox
         legend_y = oy + h * self.cell + 8
-        legend = [("EMPTY", EMPTY), ("ROOM", ROOM), ("CORRIDOR", CORRIDOR), ("STAIR_UP", STAIR_UP), ("current path", -1)]
+        legend = [("EMPTY", EMPTY), ("ROOM", ROOM), ("CORRIDOR", CORRIDOR), ("STAIR_UP", STAIR_UP), ("selected path", -1), ("EXTRA candidates", -2)]
         lx = legend_x
         for name, tile in legend:
-            color = "#ff3b30" if tile == -1 else self.COLORS[tile]
+            if tile == -1:
+                color = "#ff3b30"
+            elif tile == -2:
+                color = "#00e5ff"
+            else:
+                color = self.COLORS[tile]
             self.canvas.create_rectangle(lx, legend_y, lx + 12, legend_y + 12, outline="", fill=color)
             self.canvas.create_text(lx + 16, legend_y + 6, anchor="w", fill="#d8d8d8", font=("Arial", 9), text=name)
-            lx += 92
+            lx += 116 if tile < 0 else 92
 
         folded_seed = unity_build_settings_seed_from_text(self.seed_var.get()) if self.seed_var.get().strip() else "random"
         self.status_var.set(f"Step {self.index + 1}/{len(self.steps)}   Unity Seed={folded_seed}   cached draw")
