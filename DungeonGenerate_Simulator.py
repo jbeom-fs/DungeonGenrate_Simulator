@@ -33,8 +33,6 @@ CORRIDOR = 2
 STAIR_UP = 3
 DOOR_CLOSED = 5
 
-VIEWER_BUILD = "EXTRA source-room cycle build 2026-05-15 r4"
-
 
 # -----------------------------
 # C# unchecked int + System.Random compatible enough for Unity/old .NET Random
@@ -144,13 +142,13 @@ class DotNetRandom:
 # -----------------------------
 @dataclass
 class DungeonSettings:
-    map_width: int = 80
-    map_height: int = 50
-    min_room_size: int = 5
-    max_room_size: int = 14
+    map_width: int = 120
+    map_height: int = 80
+    min_room_size: int = 10
+    max_room_size: int = 50
     bsp_depth: int = 4
     padding: int = 2
-    extra_conn_prob: float = 0.5
+    extra_conn_prob: float = 0.3
     extra_candidate_count: int = 12
     extra_overlap_score_weight: int = 20
     extra_path_length_penalty_weight: int = 8
@@ -298,14 +296,14 @@ class DungeonGenerator:
             key = (candidate.src_idx, candidate.dst_idx, candidate.candidate_index, candidate.extra_attempt_index)
             if key == selected_key:
                 continue
-            label = f"C{color_index}: R{candidate.src_idx}->R{candidate.dst_idx} score={candidate.score}"
+            label = f"C{color_index}: R{candidate.src_idx}->{candidate.dst_idx} score={candidate.score}"
             overlays.append((candidate.path[:], cls.extra_candidate_color(color_index), label))
             color_index += 1
 
         # Keep the selected candidate in the overlay list too, but reserve red for the existing current-path highlight.
         # This lets users compare it against all other pair-best candidates while preserving the final choice.
         if selected is not None:
-            label = f"SELECTED R{selected.src_idx}->R{selected.dst_idx} score={selected.score}"
+            label = f"SELECTED R{selected.src_idx}->{selected.dst_idx} score={selected.score}"
             overlays.append((selected.path[:], "#ff3b30", label))
         return overlays
 
@@ -431,21 +429,15 @@ class DungeonGenerator:
         self.connect_extra_corridors(mst_pairs, path_buf)
 
     def connect_extra_corridors(self, connected_pairs: Set[Tuple[int, int]], path_buf: List[Tuple[int, int]]) -> None:
-        """Source-room based EXTRA visualization/generation flow.
+        """Source-room-cycle EXTRA flow for the simulator.
 
-        Display and generation order requested for the simulator:
-        - After MST is fully complete, iterate source rooms in stable room-index order.
-        - For each source room, roll ExtraConnProb first.
-        - If the source room does not generate EXTRA, snapshot that check and move to the next room.
-        - If it generates, review that source room's room pairs one by one.
-        - Each room pair step displays that pair's clean candidates and highlights the pair-best path.
-        - Then a source summary step displays all pair-best paths for that source and highlights the
-          source-best path.
-        - The source-best path is carved as that source room's EXTRA corridor, then the simulator
-          moves to the next source room.
-
-        EXTRA never mutates MST connected/remaining state; connected_pairs is only used to avoid
-        duplicate MST/EXTRA room-pair connections.
+        Display and generation order:
+        - Finish every MST edge first.
+        - For each source room Rsrc, roll ExtraConnProb once.
+        - If the source room creates EXTRA, review Rsrc -> every other room pair one by one.
+        - Each pair step shows only that pair's ExtraCandidateCount candidates and its best candidate.
+        - After all pairs for that source room, show the pair-best candidates and the final best for that source room.
+        - Carve only that final best path, then move to the next source room.
         """
         n = len(self.rooms)
         if n < 2:
@@ -457,143 +449,125 @@ class DungeonGenerator:
             self.snapshot("05. EXTRA 후보 검토 생략", note="ExtraCandidateCount <= 0")
             return
 
-        pair_candidates: List[ExtraCorridorCandidate] = []
         carved_count = 0
+        pair_candidates: List[ExtraCorridorCandidate] = []
+        dirty_overlays: List[Tuple[List[Tuple[int, int]], str, str]] = []
+        source_pair_bests: List[ExtraCorridorCandidate] = []
 
-        for source_idx in range(n):
+        for src_idx in range(n):
             roll = self.rng.next_double()
-            source_title_prefix = f"05-R{source_idx:02d}"
-            self.snapshot(
-                f"{source_title_prefix}. EXTRA 생성 체크 R{source_idx}",
-                note=(
-                    f"source=R{source_idx} roll={roll:.6f} "
-                    f"ExtraConnProb={self.s.extra_conn_prob} "
-                    f"willGenerate={roll < self.s.extra_conn_prob}"
-                ),
-            )
-
             if roll >= self.s.extra_conn_prob:
                 self.snapshot(
-                    f"{source_title_prefix}. EXTRA 생성 스킵 R{source_idx}",
-                    note=f"source=R{source_idx} roll={roll:.6f} >= ExtraConnProb={self.s.extra_conn_prob}",
+                    f"05-R{src_idx:02d}. EXTRA 생성 체크: 스킵",
+                    note=f"source=R{src_idx} roll={roll:.6f} >= ExtraConnProb={self.s.extra_conn_prob}"
                 )
                 continue
 
-            source_pair_best_candidates: List[ExtraCorridorCandidate] = []
-            rejected_notes: List[str] = []
+            self.snapshot(
+                f"05-R{src_idx:02d}. EXTRA 생성 체크: 진행",
+                note=f"source=R{src_idx} roll={roll:.6f} < ExtraConnProb={self.s.extra_conn_prob}"
+            )
+
+            source_pair_bests.clear()
             checked_pairs = 0
             skipped_connected_pairs = 0
+            rejected_total = 0
 
-            pair_display_index = 0
             for dst_idx in range(n):
-                if dst_idx == source_idx:
+                if dst_idx == src_idx:
                     continue
 
-                pair_key = (min(source_idx, dst_idx), max(source_idx, dst_idx))
+                pair_key = (min(src_idx, dst_idx), max(src_idx, dst_idx))
                 if pair_key in connected_pairs:
                     skipped_connected_pairs += 1
+                    self.snapshot(
+                        f"05-R{src_idx:02d}. pair R{src_idx} -> R{dst_idx} 스킵",
+                        note=f"pair R{src_idx}->R{dst_idx} already connected by MST or earlier EXTRA"
+                    )
                     continue
 
                 checked_pairs += 1
-                pair_display_index += 1
                 pair_candidates.clear()
-                before_rejected_count = len(rejected_notes)
-                dist_sq = self.center_dist_sq(self.rooms[source_idx], self.rooms[dst_idx])
+                dirty_overlays.clear()
+                rejected_notes: List[str] = []
+                dist_sq = self.center_dist_sq(self.rooms[src_idx], self.rooms[dst_idx])
                 self.build_extra_path_candidates_for_pair(
-                    source_idx, dst_idx, dist_sq, source_idx, path_buf, pair_candidates, rejected_notes
+                    src_idx, dst_idx, dist_sq, src_idx, path_buf, pair_candidates, rejected_notes, dirty_overlays
                 )
+                rejected_total += len(rejected_notes)
 
                 if not pair_candidates:
-                    pair_rejects = rejected_notes[before_rejected_count:len(rejected_notes)]
                     note = (
-                        f"source=R{source_idx} pair=R{source_idx}->R{dst_idx} "
-                        f"clean_candidates=0 requestedPerPair={self.s.extra_candidate_count} "
-                        f"dirtyRejected={len(pair_rejects)}"
+                        f"source=R{src_idx} pair=R{src_idx}->R{dst_idx} cleanCandidates=0 "
+                        f"requested={self.s.extra_candidate_count}"
                     )
-                    if pair_rejects:
-                        note += "\n" + "\n".join(pair_rejects[:8])
-                        if len(pair_rejects) > 8:
-                            note += f"\n... rejected {len(pair_rejects) - 8} more for this pair"
-                    self.snapshot(
-                        f"{source_title_prefix}.P{pair_display_index:02d} EXTRA 후보 없음 R{source_idx} -> R{dst_idx}",
-                        note=note,
-                    )
+                    if rejected_notes:
+                        note += "\n" + "\n".join(rejected_notes[:10])
+                        if len(rejected_notes) > 10:
+                            note += f"\n... rejected {len(rejected_notes) - 10} more"
+                    self.snapshot(f"05-R{src_idx:02d}. R{src_idx} -> R{dst_idx} 후보 없음", note=note, extra_paths=dirty_overlays[:])
                     continue
 
                 pair_best = self.select_best_extra_corridor_candidate(pair_candidates)
-                source_pair_best_candidates.append(pair_best)
-                pair_overlays = self.build_extra_candidate_overlays(pair_candidates, pair_best)
-                pair_note = (
-                    f"source=R{source_idx} pair=R{source_idx}->R{dst_idx} "
-                    f"clean_candidates={len(pair_candidates)} requestedPerPair={self.s.extra_candidate_count} "
-                    f"pairBest candidate={pair_best.candidate_index} {pair_best.axis_name} score={pair_best.score} "
-                    f"cells={pair_best.path_len} overlap={pair_best.overlap} parallel={pair_best.parallel_run} "
-                    f"centerDistSq={pair_best.center_dist_sq} "
+                source_pair_bests.append(pair_best)
+                overlays = dirty_overlays[:] + self.build_extra_candidate_overlays(pair_candidates, pair_best)
+                note = (
+                    f"source=R{src_idx} pair=R{src_idx}->R{dst_idx} "
+                    f"cleanCandidates={len(pair_candidates)} requested={self.s.extra_candidate_count} "
+                    f"bestCandidate={pair_best.candidate_index} score={pair_best.score} "
+                    f"cells={pair_best.path_len} overlap={pair_best.overlap} "
+                    f"parallel={pair_best.parallel_run} centerDistSq={pair_best.center_dist_sq} "
                     f"scoreWeights(overlap={self.s.extra_overlap_score_weight}, "
                     f"pathLen={self.s.extra_path_length_penalty_weight}, "
                     f"centerDiv={self.s.extra_center_distance_penalty_divisor})"
                 )
+                if rejected_notes:
+                    note += "\n" + "\n".join(rejected_notes[:8])
+                    if len(rejected_notes) > 8:
+                        note += f"\n... rejected {len(rejected_notes) - 8} more"
                 self.snapshot(
-                    f"{source_title_prefix}.P{pair_display_index:02d} EXTRA 후보군 R{source_idx} -> R{dst_idx}",
-                    pair_best.path,
-                    pair_note,
-                    extra_paths=pair_overlays,
+                    f"05-R{src_idx:02d}. R{src_idx} -> R{dst_idx} 후보군 + pair best",
+                    pair_best.path, note, extra_paths=overlays
                 )
 
-            if not source_pair_best_candidates:
-                note = (
-                    f"source=R{source_idx} checked_pairs={checked_pairs} "
-                    f"skipped_connected_pairs={skipped_connected_pairs} pair_best_candidates=0"
+            if not source_pair_bests:
+                self.snapshot(
+                    f"05-R{src_idx:02d}. source R{src_idx} EXTRA 선택 없음",
+                    note=(
+                        f"source=R{src_idx} checked_pairs={checked_pairs} "
+                        f"skipped_connected_pairs={skipped_connected_pairs} rejected={rejected_total} "
+                        "pairBestCandidates=0"
+                    )
                 )
-                if rejected_notes:
-                    note += "\n" + "\n".join(rejected_notes[:12])
-                    if len(rejected_notes) > 12:
-                        note += f"\n... rejected {len(rejected_notes) - 12} more"
-                self.snapshot(f"{source_title_prefix}. EXTRA 선택 없음 R{source_idx}", note=note)
                 continue
 
-            source_best = self.select_best_extra_corridor_candidate(source_pair_best_candidates)
-            source_overlays = self.build_extra_candidate_overlays(source_pair_best_candidates, source_best)
-            source_note = (
-                f"source=R{source_idx} sourcePairBestCount={len(source_pair_best_candidates)} "
-                f"checked_pairs={checked_pairs} skipped_connected_pairs={skipped_connected_pairs} "
-                f"sourceBest R{source_best.src_idx}->R{source_best.dst_idx} "
-                f"candidate={source_best.candidate_index} {source_best.axis_name} score={source_best.score} "
-                f"cells={source_best.path_len} overlap={source_best.overlap} parallel={source_best.parallel_run} "
-                f"centerDistSq={source_best.center_dist_sq} "
-                f"shown_candidates={max(0, len(source_overlays) - 1)} source room-pair best candidates only"
+            selected = self.select_best_extra_corridor_candidate(source_pair_bests)
+            summary_overlays = self.build_extra_candidate_overlays(source_pair_bests, selected)
+            summary_note = (
+                f"source=R{src_idx} final selected R{selected.src_idx}->{selected.dst_idx} "
+                f"candidate={selected.candidate_index} score={selected.score} "
+                f"pairBestCount={len(source_pair_bests)} checked_pairs={checked_pairs} "
+                f"skipped_connected_pairs={skipped_connected_pairs} cells={selected.path_len} "
+                f"overlap={selected.overlap} parallel={selected.parallel_run} "
+                f"centerDistSq={selected.center_dist_sq}"
             )
             self.snapshot(
-                f"{source_title_prefix}. EXTRA R{source_idx} pair-best 모음",
-                source_best.path,
-                source_note,
-                extra_paths=source_overlays,
+                f"05-R{src_idx:02d}. source R{src_idx} pair-best 후보군 + 최종 best",
+                selected.path, summary_note, extra_paths=summary_overlays
             )
 
-            self.carve_path(source_best.path)
-            connected_pairs.add((min(source_best.src_idx, source_best.dst_idx), max(source_best.src_idx, source_best.dst_idx)))
+            self.carve_path(selected.path)
+            connected_pairs.add((min(selected.src_idx, selected.dst_idx), max(selected.src_idx, selected.dst_idx)))
             carved_count += 1
-            carve_note = (
-                f"source=R{source_idx} carved R{source_best.src_idx} -> R{source_best.dst_idx} "
-                f"{source_best.axis_name} candidate={source_best.candidate_index} score={source_best.score} "
-                f"sourcePairBestCount={len(source_pair_best_candidates)} checked_pairs={checked_pairs} "
-                f"skipped_connected_pairs={skipped_connected_pairs} cells={source_best.path_len} "
-                f"overlap={source_best.overlap} parallel={source_best.parallel_run} "
-                f"scoreWeights(overlap={self.s.extra_overlap_score_weight}, "
-                f"pathLen={self.s.extra_path_length_penalty_weight}, "
-                f"centerDiv={self.s.extra_center_distance_penalty_divisor}) "
-                f"centerDistSq={source_best.center_dist_sq} requestedPerPair={self.s.extra_candidate_count} "
-                f"carvedExtrasSoFar={carved_count}"
-            )
             self.snapshot(
-                f"{source_title_prefix}. EXTRA 통로 생성 R{source_best.src_idx} -> R{source_best.dst_idx}",
-                source_best.path,
-                carve_note,
-                extra_paths=None,
+                f"05-R{src_idx:02d}. source R{src_idx} EXTRA 통로 생성 R{selected.src_idx} -> R{selected.dst_idx}",
+                selected.path,
+                note=f"carvedExtrasSoFar={carved_count} selectedScore={selected.score} selectedCells={selected.path_len}"
             )
 
         if carved_count == 0:
-            self.snapshot("05. EXTRA 최종 결과", note=f"carved=0 sourceRoomCycles={n}")
+            self.snapshot("05. EXTRA 최종 결과", note=f"carved=0 sourceRooms={n}")
+
     def build_extra_path_candidates_for_pair(
         self,
         src_idx: int,
@@ -603,6 +577,7 @@ class DungeonGenerator:
         path_buf: List[Tuple[int, int]],
         candidates: List[ExtraCorridorCandidate],
         rejected_notes: List[str],
+        dirty_overlays: Optional[List[Tuple[List[Tuple[int, int]], str, str]]] = None,
     ) -> None:
         src = self.rooms[src_idx]
         dst = self.rooms[dst_idx]
@@ -614,7 +589,7 @@ class DungeonGenerator:
             self.emit_extra_path_candidate(src, dst, horiz_first, candidate_index, path_buf)
             self.try_add_extra_candidate(
                 src_idx, dst_idx, dist_sq, primary_path, attempt_index, candidate_index,
-                path_buf, candidates, rejected_notes
+                path_buf, candidates, rejected_notes, dirty_overlays
             )
 
     def try_add_extra_candidate(
@@ -628,21 +603,29 @@ class DungeonGenerator:
         path_buf: List[Tuple[int, int]],
         candidates: List[ExtraCorridorCandidate],
         rejected_notes: List[str],
+        dirty_overlays: Optional[List[Tuple[List[Tuple[int, int]], str, str]]] = None,
     ) -> None:
         reject = self.corridor_candidate_reject_reason(path_buf, src_idx, dst_idx, False)
-        if reject is not None:
-            if len(rejected_notes) < 128:
-                rejected_notes.append(f"R{src_idx}->R{dst_idx} candidate={candidate_index}: reject={reject}")
-            return
-
-        if self.extra_candidate_path_already_added(candidates, path_buf):
-            return
-
         path = path_buf[:]
         path_len = len(path)
         overlap = self.count_corridor_overlap(path)
         parallel_run = self.longest_parallel_corridor_run(path)
         score = self.score_extra_corridor_candidate(path_len, dist_sq, overlap, parallel_run)
+
+        if reject is not None:
+            if len(rejected_notes) < 128:
+                rejected_notes.append(
+                    f"R{src_idx}->R{dst_idx} candidate={candidate_index}: reject={reject} "
+                    f"score={score} cells={path_len} overlap={overlap} parallel={parallel_run}"
+                )
+            if dirty_overlays is not None:
+                dirty_label = f"DIRTY C{candidate_index}: R{src_idx}->{dst_idx} score={score} reject={reject}"
+                dirty_overlays.append((path, "#777777", dirty_label))
+            return
+
+        if self.extra_candidate_path_already_added(candidates, path_buf):
+            return
+
         candidates.append(ExtraCorridorCandidate(
             src_idx=src_idx,
             dst_idx=dst_idx,
@@ -773,8 +756,8 @@ class DungeonGenerator:
     def score_extra_corridor_candidate(self, path_len: int, center_dist_sq: int, overlap: int, parallel_run: int) -> int:
         # Latest tuning: score weights are exposed through DungeonManager/Viewer.
         # parallel_run is still measured for debug notes/dirty checks, but no longer
-        # subtracts from the score. Center-distance divisor is exposed through
-        # DungeonManager/Viewer and clamped to at least 1.
+        # subtracts from the score. Center-distance divisor remains fixed at 20 in
+        # the supplied algorithm version.
         return (
             overlap * self.s.extra_overlap_score_weight
             - path_len * self.s.extra_path_length_penalty_weight
@@ -1311,28 +1294,35 @@ class DungeonViewer(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("Proto_JBRL Dungeon Step Viewer - EXTRA source-room cycle build 2026-05-15 r4")
+        self.title("Proto_JBRL DungeonGenerate Simulator - dirty candidates build 2026-05-15 r10")
         self.geometry("1180x760")
         self.minsize(980, 660)
         self.steps: List[Step] = []
         self.index = 0
         self.cell = 10
+        self._base_cell = 10
+        self.zoom = 1.0
+        self.pan_x = 0
+        self.pan_y = 0
+        self._drag_start: Optional[Tuple[int, int]] = None
+        self._drag_origin: Tuple[int, int] = (0, 0)
         self.show_bsp = tk.BooleanVar(value=True)
         self.show_rooms = tk.BooleanVar(value=True)
         self.show_path = tk.BooleanVar(value=True)
+        self.show_dirty_candidates = tk.BooleanVar(value=True)
         self.seed_var = tk.StringVar(value="283321776792")
         self.floor_var = tk.StringVar(value="3")
-        self.map_w_var = tk.StringVar(value="80")
-        self.map_h_var = tk.StringVar(value="50")
-        self.min_room_var = tk.StringVar(value="5")
-        self.max_room_var = tk.StringVar(value="14")
+        self.map_w_var = tk.StringVar(value="120")
+        self.map_h_var = tk.StringVar(value="80")
+        self.min_room_var = tk.StringVar(value="10")
+        self.max_room_var = tk.StringVar(value="50")
         self.bsp_depth_var = tk.StringVar(value="4")
         self.padding_var = tk.StringVar(value="2")
-        self.extra_conn_var = tk.StringVar(value="0.5")
+        self.extra_conn_var = tk.StringVar(value="0.3")
         self.extra_candidate_count_var = tk.StringVar(value="12")
         self.extra_overlap_weight_var = tk.StringVar(value="20")
         self.extra_path_len_weight_var = tk.StringVar(value="8")
-        self.extra_center_distance_divisor_var = tk.StringVar(value="20")
+        self.extra_center_dist_divisor_var = tk.StringVar(value="20")
         self.min_straight_var = tk.StringVar(value="2")
         self.max_floor_var = tk.StringVar(value="100")
         self.status_var = tk.StringVar(value="")
@@ -1343,8 +1333,8 @@ class DungeonViewer(tk.Tk):
         self._scale_after_id: Optional[str] = None
         self._scale_target_index: Optional[int] = None
         self._setting_scale = False
-        self._draw_cache: Dict[Tuple[int, int, bool, bool, bool], ImageTk.PhotoImage] = {}
-        self._draw_cache_order: List[Tuple[int, int, bool, bool, bool]] = []
+        self._draw_cache: Dict[Tuple[int, int, bool, bool, bool, bool], ImageTk.PhotoImage] = {}
+        self._draw_cache_order: List[Tuple[int, int, bool, bool, bool, bool]] = []
         self._photo_ref: Optional[ImageTk.PhotoImage] = None
         self._build_ui()
         self.bind("<Left>", lambda e: self.prev_step())
@@ -1370,6 +1360,7 @@ class DungeonViewer(tk.Tk):
         ttk.Checkbutton(top, text="BSP", variable=self.show_bsp, command=self.draw).pack(side=tk.LEFT)
         ttk.Checkbutton(top, text="Rooms", variable=self.show_rooms, command=self.draw).pack(side=tk.LEFT)
         ttk.Checkbutton(top, text="Path", variable=self.show_path, command=self.draw).pack(side=tk.LEFT)
+        ttk.Checkbutton(top, text="Dirty", variable=self.show_dirty_candidates, command=self.draw).pack(side=tk.LEFT)
         ttk.Label(top, text="  ← / →: step, Space: play/pause, Enter: regenerate").pack(side=tk.LEFT, padx=(12, 0))
 
         settings_box = ttk.LabelFrame(self, text="Unity DungeonSettings", padding=(8, 4, 8, 6))
@@ -1390,12 +1381,18 @@ class DungeonViewer(tk.Tk):
         self._add_labeled_entry(settings_row2, "Extra Candidate Count", self.extra_candidate_count_var, 4)
         self._add_labeled_entry(settings_row2, "Extra Overlap Score Weight", self.extra_overlap_weight_var, 4)
         self._add_labeled_entry(settings_row2, "Extra Path Length Penalty Weight", self.extra_path_len_weight_var, 4)
-        self._add_labeled_entry(settings_row3, "Extra Center Distance Penalty Divisor", self.extra_center_distance_divisor_var, 4)
+        self._add_labeled_entry(settings_row3, "Extra Center Distance Penalty Divisor", self.extra_center_dist_divisor_var, 4)
         self._add_labeled_entry(settings_row3, "MinStraight", self.min_straight_var, 4)
         self._add_labeled_entry(settings_row3, "MaxFloor", self.max_floor_var, 5)
 
         self.canvas = tk.Canvas(self, bg="#1b1d22", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
+        self.canvas.bind("<Button-4>", self.on_mouse_wheel)
+        self.canvas.bind("<Button-5>", self.on_mouse_wheel)
+        self.canvas.bind("<ButtonPress-1>", self.on_drag_start)
+        self.canvas.bind("<B1-Motion>", self.on_drag_move)
+        self.canvas.bind("<ButtonRelease-1>", self.on_drag_end)
 
         bottom = ttk.Frame(self, padding=(8, 0, 8, 8))
         bottom.pack(fill=tk.X)
@@ -1425,7 +1422,7 @@ class DungeonViewer(tk.Tk):
                 extra_candidate_count=int(self.extra_candidate_count_var.get().strip()),
                 extra_overlap_score_weight=int(self.extra_overlap_weight_var.get().strip()),
                 extra_path_length_penalty_weight=int(self.extra_path_len_weight_var.get().strip()),
-                extra_center_distance_penalty_divisor=int(self.extra_center_distance_divisor_var.get().strip()),
+                extra_center_distance_penalty_divisor=int(self.extra_center_dist_divisor_var.get().strip()),
                 min_straight=int(self.min_straight_var.get().strip()),
                 max_floor=int(self.max_floor_var.get().strip()),
                 seed=seed,
@@ -1434,6 +1431,9 @@ class DungeonViewer(tk.Tk):
             gen = DungeonGenerator(settings)
             self.steps = gen.generate()
             self._clear_draw_cache()
+            self.zoom = 1.0
+            self.pan_x = 0
+            self.pan_y = 0
             self.index = 0
             self.scale.configure(to=max(0, len(self.steps) - 1))
             self.scale.set(0)
@@ -1461,6 +1461,66 @@ class DungeonViewer(tk.Tk):
         self.index = self._scale_target_index
         self._scale_target_index = None
         self.draw()
+
+    def on_mouse_wheel(self, event) -> None:
+        if not self.steps:
+            return
+
+        step = self.steps[self.index]
+        h = len(step.grid)
+        w = len(step.grid[0]) if h else 0
+        if w <= 0 or h <= 0:
+            return
+
+        cw = max(1, self.canvas.winfo_width())
+        ch = max(1, self.canvas.winfo_height())
+        margin = 18
+        title_h = 48
+        base_cell = max(3, int(min((cw - margin * 2) / w, (ch - title_h - margin) / h)))
+
+        old_zoom = self.zoom
+        old_cell = max(2, int(base_cell * old_zoom))
+        old_ox = (cw - w * old_cell) // 2 + self.pan_x
+        old_oy = title_h + self.pan_y
+
+        # Canvas-local mouse position. The grid coordinate under this exact point
+        # is preserved after zoom, so the view zooms toward the cursor instead of
+        # drifting around the canvas center.
+        mx = getattr(event, "x", cw // 2)
+        my = getattr(event, "y", ch // 2)
+        grid_x = (mx - old_ox) / old_cell
+        grid_y = (my - old_oy) / old_cell
+
+        if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+            factor = 1.15
+        else:
+            factor = 1 / 1.15
+        new_zoom = max(0.5, min(10.0, old_zoom * factor))
+        if abs(new_zoom - old_zoom) < 1e-6:
+            return
+
+        new_cell = max(2, int(base_cell * new_zoom))
+        new_center_ox = (cw - w * new_cell) // 2
+        self.zoom = new_zoom
+        self.pan_x = int(round(mx - new_center_ox - grid_x * new_cell))
+        self.pan_y = int(round(my - title_h - grid_y * new_cell))
+        self.draw()
+
+    def on_drag_start(self, event) -> None:
+        self._drag_start = (event.x, event.y)
+        self._drag_origin = (self.pan_x, self.pan_y)
+
+    def on_drag_move(self, event) -> None:
+        if self._drag_start is None:
+            return
+        sx, sy = self._drag_start
+        ox, oy = self._drag_origin
+        self.pan_x = ox + (event.x - sx)
+        self.pan_y = oy + (event.y - sy)
+        self.draw()
+
+    def on_drag_end(self, event) -> None:
+        self._drag_start = None
 
     def toggle_play(self) -> None:
         if self.is_playing:
@@ -1527,7 +1587,7 @@ class DungeonViewer(tk.Tk):
         hex_color = hex_color.lstrip("#")
         return int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
 
-    def _remember_cached_image(self, key: Tuple[int, int, bool, bool, bool], photo: ImageTk.PhotoImage) -> None:
+    def _remember_cached_image(self, key: Tuple[int, int, bool, bool, bool, bool], photo: ImageTk.PhotoImage) -> None:
         self._draw_cache[key] = photo
         self._draw_cache_order.append(key)
         # Keep cache bounded. The viewer can generate many steps, and PhotoImage
@@ -1540,7 +1600,8 @@ class DungeonViewer(tk.Tk):
         show_bsp = bool(self.show_bsp.get())
         show_rooms = bool(self.show_rooms.get())
         show_path = bool(self.show_path.get())
-        key = (step_index, cell, show_bsp, show_rooms, show_path)
+        show_dirty = bool(self.show_dirty_candidates.get())
+        key = (step_index, cell, show_bsp, show_rooms, show_path, show_dirty)
         cached = self._draw_cache.get(key)
         if cached is not None:
             return cached
@@ -1574,16 +1635,43 @@ class DungeonViewer(tk.Tk):
                 rect_grid(r.x, r.y, r.w, r.h, "#e8f1a1", 1)
 
         if show_path and step.extra_paths:
+            def candidate_score_label(raw_label: str) -> str:
+                # Overlay compact labels directly on the path. Examples:
+                #   "C3: R1->R4 score=-120" -> "C3 -120"
+                #   "SELECTED R1->R4 score=-80" -> "S -80"
+                prefix = raw_label.split(":", 1)[0].strip()
+                if prefix.startswith("SELECTED"):
+                    prefix = "S"
+                elif prefix.startswith("DIRTY C"):
+                    prefix = "D" + prefix.split("DIRTY C", 1)[1].strip()
+                score_text = ""
+                marker = "score="
+                if marker in raw_label:
+                    score_text = raw_label.split(marker, 1)[1].split()[0].strip()
+                return f"{prefix} {score_text}".strip()
+
+            def draw_text_with_shadow(pos: Tuple[int, int], text_value: str, fill: str) -> None:
+                x, y = pos
+                # A small dark backing keeps score labels readable over rooms/corridors.
+                draw.text((x + 1, y + 1), text_value, fill="#000000")
+                draw.text((x, y), text_value, fill=fill)
+
             for candidate_path, color, label in step.extra_paths:
+                is_dirty_candidate = label.startswith("DIRTY ")
+                if is_dirty_candidate and not show_dirty:
+                    continue
                 for x, y in set(candidate_path):
                     if 0 <= x < w and 0 <= y < h:
                         x0, y0 = x * cell, y * cell
                         draw.rectangle([x0 + 1, y0 + 1, x0 + cell - 1, y0 + cell - 1], outline=color, width=max(1, min(2, cell // 3)))
-                if candidate_path and cell >= 6:
-                    lx, ly = candidate_path[0]
+                if candidate_path and cell >= 5:
+                    # Put the score near the middle of each candidate path so every candidate
+                    # can be identified in room-pair candidate and pair-best summary steps.
+                    label_index = min(len(candidate_path) - 1, max(0, len(candidate_path) // 2))
+                    lx, ly = candidate_path[label_index]
                     if 0 <= lx < w and 0 <= ly < h:
-                        short_label = label.split(":", 1)[0].replace("SELECTED", "S")
-                        draw.text((lx * cell + 1, ly * cell + 1), short_label, fill=color)
+                        score_label = candidate_score_label(label)
+                        draw_text_with_shadow((lx * cell + 1, ly * cell + 1), score_label, color)
 
         if show_path and step.path:
             for x, y in set(step.path):
@@ -1606,18 +1694,20 @@ class DungeonViewer(tk.Tk):
         ch = max(1, self.canvas.winfo_height())
         margin = 18
         title_h = 48
-        self.cell = max(3, int(min((cw - margin * 2) / w, (ch - title_h - margin) / h)))
-        ox = (cw - w * self.cell) // 2
-        oy = title_h
+        self._base_cell = max(3, int(min((cw - margin * 2) / w, (ch - title_h - margin) / h)))
+        self.cell = max(2, int(self._base_cell * self.zoom))
+        ox = (cw - w * self.cell) // 2 + self.pan_x
+        oy = title_h + self.pan_y
+
+        self._photo_ref = self._get_rendered_map_image(step, self.index, self.cell)
+        map_image_id = self.canvas.create_image(ox, oy, anchor="nw", image=self._photo_ref, tags=("map_image",))
+        self.canvas.tag_lower(map_image_id)
 
         self.canvas.create_text(16, 12, anchor="nw", fill="#f2f2f2", font=("Arial", 13, "bold"), text=step.title)
         if step.note:
             self.canvas.create_text(16, 34, anchor="nw", fill="#c8c8c8", font=("Arial", 10), text=step.note)
         self.canvas.create_text(cw - 16, 12, anchor="ne", fill="#9aa4b2", font=("Arial", 9),
-                                text="Optimized: cached image rendering + debounced timeline")
-
-        self._photo_ref = self._get_rendered_map_image(step, self.index, self.cell)
-        self.canvas.create_image(ox, oy, anchor="nw", image=self._photo_ref)
+                                text=f"Zoom {self.zoom:.2f}x | wheel: zoom, drag: pan" )
 
         if self.show_rooms.get():
             for i, r in enumerate(step.rooms):
@@ -1628,13 +1718,15 @@ class DungeonViewer(tk.Tk):
 
         legend_x = ox
         legend_y = oy + h * self.cell + 8
-        legend = [("EMPTY", EMPTY), ("ROOM", ROOM), ("CORRIDOR", CORRIDOR), ("STAIR_UP", STAIR_UP), ("selected path", -1), ("EXTRA candidates", -2)]
+        legend = [("EMPTY", EMPTY), ("ROOM", ROOM), ("CORRIDOR", CORRIDOR), ("STAIR_UP", STAIR_UP), ("selected path", -1), ("EXTRA candidates", -2), ("DIRTY candidates", -3)]
         lx = legend_x
         for name, tile in legend:
             if tile == -1:
                 color = "#ff3b30"
             elif tile == -2:
                 color = "#00e5ff"
+            elif tile == -3:
+                color = "#777777"
             else:
                 color = self.COLORS[tile]
             self.canvas.create_rectangle(lx, legend_y, lx + 12, legend_y + 12, outline="", fill=color)
