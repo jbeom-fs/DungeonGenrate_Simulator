@@ -14,3 +14,12 @@ build/DungeonGenrate_Simulator/warn-DungeonGenrate_Simulator.txt
 build/DungeonGenrate_Simulator/xref-DungeonGenrate_Simulator.html
 dist/DungeonGenrate_Simulator.exe
 DungeonGenrate_Simulator.spec
+*.spec
+*.exe
+*.html
+*.txt
+*.toc
+*.pyz
+*.pyc
+*.pkg
+*.zip
