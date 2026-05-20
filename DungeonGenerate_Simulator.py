@@ -432,14 +432,16 @@ class DungeonGenerator:
         return connected_pairs, mst_edges
 
     def assign_elite_room(self, mst_edges: List[Tuple[int, int]]) -> None:
-        """Unity parity: after MST, pick one leaf room as Elite Room.
+        """Unity parity: after MST, deterministically pick one leaf room as Elite Room.
 
         Leaf means MST degree == 1. Candidates are ranked by:
         1) deeper MST depth from R0 first,
         2) farther squared distance from R0 first,
         3) smaller room index first.
-        Unity then randomly picks one from the top 3 candidates using the same
-        System.Random stream, so this call must happen before EXTRA generation.
+
+        Important parity detail: current Unity code does NOT consume the dungeon
+        System.Random stream for Elite Room selection. Consuming RNG here shifts
+        all following EXTRA corridor rolls/candidates and stair room placement.
         """
         self.elite_room_index = -1
 
@@ -467,6 +469,8 @@ class DungeonGenerator:
                 degree[a] += 1
                 degree[b] += 1
 
+        # Unity-like BFS from R0 over the MST tree. The adjacency append order is
+        # the MST carve order, so keep it untouched for tie stability.
         depth = [-1] * n
         depth[0] = 0
         queue = [0]
@@ -483,6 +487,7 @@ class DungeonGenerator:
         start = self.rooms[0]
         leaf_candidates = [i for i in range(1, n) if degree[i] == 1]
         if not leaf_candidates:
+            self.snapshot("04E. Elite Room 후보 없음", note="no MST leaf candidates except R0; RNG not consumed")
             return
 
         def dist_sq_from_start(idx: int) -> int:
@@ -492,13 +497,12 @@ class DungeonGenerator:
             return dx * dx + dy * dy
 
         leaf_candidates.sort(key=lambda i: (-(depth[i] if depth[i] >= 0 else -999999), -dist_sq_from_start(i), i))
-        top_count = min(3, len(leaf_candidates))
-        selected = leaf_candidates[self.rng.next(top_count)]
+        selected = leaf_candidates[0]
         self.elite_room_index = selected
-        rank_text = ", ".join(f"R{i}(depth={depth[i]},distSq={dist_sq_from_start(i)})" for i in leaf_candidates[:top_count])
+        rank_text = ", ".join(f"R{i}(depth={depth[i]},distSq={dist_sq_from_start(i)})" for i in leaf_candidates)
         self.snapshot(
             f"04E. Elite Room 선택 R{selected}",
-            note=f"leaf candidates={len(leaf_candidates)} top{top_count}=[{rank_text}] selected=R{selected}; EXTRA candidates touching R{selected} will be skipped",
+            note=f"leaf candidates={len(leaf_candidates)} ranked=[{rank_text}] selected=R{selected}; deterministic selection; RNG not consumed; EXTRA candidates touching R{selected} will be skipped",
         )
 
     def connect_extra_corridors(self, connected_pairs: Set[Tuple[int, int]], path_buf: List[Tuple[int, int]]) -> None:
@@ -1338,7 +1342,7 @@ class DungeonViewer(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("Proto_JBRL DungeonGenerate Simulator - Unity Elite Room parity build 2026-05-20 r16")
+        self.title("Proto_JBRL DungeonGenerate Simulator - Unity Elite Room deterministic parity build 2026-05-20 r17")
         self.geometry("1180x760")
         self.minsize(980, 660)
         self.steps: List[Step] = []
