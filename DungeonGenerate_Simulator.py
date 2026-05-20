@@ -1,8 +1,8 @@
 """
-Proto_JBRL Dungeon Step Viewer - MST-then-EXTRA parity fix 2026-05-19 r13
+Proto_JBRL Dungeon Step Viewer - Elite floors parity fix 2026-05-20 r16
 
 Python/Tkinter visualizer that ports the current Proto_JBRL DungeonGenerator flow:
-Seed+Floor -> BSP split -> room placement -> room fill -> MST corridors -> pair-scored EXTRA corridor -> stair placement.
+Seed+Floor -> BSP split -> room placement -> room fill -> MST corridors -> Elite leaf room selection -> pair-scored EXTRA corridor -> stair placement.
 
 Controls:
 - Enter seed and floor, then click Generate / Enter
@@ -32,6 +32,7 @@ EMPTY = 0
 ROOM = 1
 CORRIDOR = 2
 STAIR_UP = 3
+ELITE_ROOM_MARKER = 98
 DOOR_CLOSED = 5
 
 
@@ -249,6 +250,7 @@ class Step:
     path: List[Tuple[int, int]]
     note: str = ""
     extra_paths: Optional[List[Tuple[List[Tuple[int, int]], str, str]]] = None
+    elite_room_index: int = -1
 
 
 # -----------------------------
@@ -263,6 +265,7 @@ class DungeonGenerator:
         self.corridor_tiles: Set[Tuple[int, int]] = set()
         self.rooms: List[Room] = []
         self.steps: List[Step] = []
+        self.elite_room_index: int = -1
         self.nodes: List[BSPNode] = []
 
     def snapshot(
@@ -276,7 +279,7 @@ class DungeonGenerator:
         copied_extra_paths = None
         if extra_paths:
             copied_extra_paths = [(list(candidate_path), color, label) for candidate_path, color, label in extra_paths]
-        self.steps.append(Step(title, copied_grid, self.rooms[:], self.nodes[:], list(path or []), note, copied_extra_paths))
+        self.steps.append(Step(title, copied_grid, self.rooms[:], self.nodes[:], list(path or []), note, copied_extra_paths, self.elite_room_index))
 
     @staticmethod
     def extra_candidate_color(index: int) -> str:
@@ -327,8 +330,9 @@ class DungeonGenerator:
         for i, room in enumerate(self.rooms):
             self.fill_room(room)
             self.snapshot(f"03-{i+1:02d}. 방 바닥 채우기 R{i}")
-        connected_pairs, path_buf = self.connect_mst_all()
-        self.connect_extra_corridors(connected_pairs, path_buf)
+        connected_pairs, mst_edges = self.connect_mst_all()
+        self.assign_elite_room(mst_edges)
+        self.connect_extra_corridors(connected_pairs, [])
         self.place_stairs()
         self.snapshot("99. 최종 던전")
         return self.steps
@@ -395,154 +399,107 @@ class DungeonGenerator:
 
 
     def connect_mst_all(self) -> Tuple[Set[Tuple[int, int]], List[Tuple[int, int]]]:
-        """Build only the MST corridor set first, then return direct-connected pairs.
-
-        This is the required flow for the current Unity algorithm:
-        1) complete all MST/mandatory corridors,
-        2) run source-room EXTRA candidate review afterward,
-        3) place stairs after the final corridor grid is fixed.
-
-        The older viewer still called connect_all(), which could interleave
-        MST/EXTRA and consumed RNG in the wrong order. That also shifted stair
-        room/position selection because stairs use the same rng instance after
-        corridor generation.
-        """
-        n = len(self.rooms)
         connected_pairs: Set[Tuple[int, int]] = set()
+        mst_edges: List[Tuple[int, int]] = []
         path_buf: List[Tuple[int, int]] = []
-        if n < 2:
+        n = len(self.rooms)
+        if n <= 1:
             return connected_pairs, path_buf
 
-        connected: Set[int] = {0}
-        remaining: Set[int] = set(range(1, n))
-        debug_step = 0
-
+        connected = {0}
+        remaining = set(range(1, n))
+        step = 0
         while remaining:
-            debug_step += 1
-            best_dist = float("inf")
-            src_idx = -1
-            dst_idx = -1
+            best: Optional[Tuple[int, int, int]] = None
+            for a in connected:
+                for b in remaining:
+                    da = self.rooms[a]
+                    db = self.rooms[b]
+                    dist = (da.cx - db.cx) * (da.cx - db.cx) + (da.cy - db.cy) * (da.cy - db.cy)
+                    if best is None or dist < best[0] or (dist == best[0] and (a, b) < (best[1], best[2])):
+                        best = (dist, a, b)
+            assert best is not None
+            _, a, b = best
+            carved, path_buf, carve_reason = self.draw_l_corridor(a, b, True, path_buf)
+            connected_pairs.add((a, b) if a < b else (b, a))
+            mst_edges.append((a, b))
+            connected.add(b)
+            remaining.remove(b)
+            step += 1
+            self.snapshot(f"04-{step:02d}. MST 통로 R{a} -> R{b}", path_buf,
+                          note=f"MST distanceSq={best[0]}; remaining={len(remaining)}")
 
-            for i in sorted(connected):
-                for j in sorted(remaining):
-                    d = self.euclidean_dist(self.rooms[i], self.rooms[j])
-                    if d < best_dist:
-                        best_dist = d
-                        src_idx = i
-                        dst_idx = j
+        return connected_pairs, mst_edges
 
-            carved, path, msg = self.draw_l_corridor(src_idx, dst_idx, True, path_buf)
-            pair = (min(src_idx, dst_idx), max(src_idx, dst_idx))
-            pair_already = pair in connected_pairs
-            connected_pairs.add(pair)
-            connected.add(dst_idx)
-            remaining.discard(dst_idx)
-            self.snapshot(
-                f"04-{debug_step:02d}. MST R{src_idx} -> R{dst_idx}",
-                path=path,
-                note=(
-                    f"MST-only phase | {msg} | carved={carved} "
-                    f"pairAdded={not pair_already} connectedAdd=R{dst_idx} remainingRemove=R{dst_idx}"
-                ),
-            )
+    def assign_elite_room(self, mst_edges: List[Tuple[int, int]]) -> None:
+        """Unity parity: after MST, pick one leaf room as Elite Room.
 
-        self.snapshot(
-            "04. MST 전체 생성 완료",
-            note=f"MST complete. connectedPairs={len(connected_pairs)}. EXTRA phase starts after this step."
-        )
-        return connected_pairs, path_buf
-
-    def connect_all(self) -> None:
-        """Mirror the last supplied Unity ConnectAll():
-        Prim MST step, then optional EXTRA from the same src room to the nearest
-        not-yet-directly-connected room. EXTRA can update connected/remaining only
-        when it actually carves, exactly like the C# source.
+        Leaf means MST degree == 1. Candidates are ranked by:
+        1) deeper MST depth from R0 first,
+        2) farther squared distance from R0 first,
+        3) smaller room index first.
+        Unity then randomly picks one from the top 3 candidates using the same
+        System.Random stream, so this call must happen before EXTRA generation.
         """
-        n = len(self.rooms)
-        if n < 2:
+        self.elite_room_index = -1
+
+        # Unity rule: Elite Room exists only on floors whose ones digit is 5
+        # (5F, 15F, 25F, 35F, 45F, ...).
+        # Non-elite floors must not consume the RNG stream here, otherwise EXTRA
+        # corridor and stair placement diverge from Unity.
+        if self.s.floor % 10 != 5:
+            self.snapshot(
+                "04E. Elite Room 없음",
+                note=f"floor={self.s.floor}; elite room only appears on floors ending with 5; RNG not consumed",
+            )
             return
 
-        connected: Set[int] = {0}
-        remaining: Set[int] = set(range(1, n))
-        connected_pairs: Set[Tuple[int, int]] = set()
-        path_buf: List[Tuple[int, int]] = []
-        debug_step = 0
+        n = len(self.rooms)
+        if n <= 1:
+            return
 
-        while remaining:
-            debug_step += 1
-            best_dist = float("inf")
-            src_idx = -1
-            dst_idx = -1
+        adjacency = [[] for _ in range(n)]
+        degree = [0] * n
+        for a, b in mst_edges:
+            if 0 <= a < n and 0 <= b < n:
+                adjacency[a].append(b)
+                adjacency[b].append(a)
+                degree[a] += 1
+                degree[b] += 1
 
-            # C# HashSet iteration order is not strictly guaranteed. For the viewer,
-            # use deterministic sorted order; Unity parity still depends primarily on
-            # the same generated room list and distance comparisons.
-            for i in sorted(connected):
-                for j in sorted(remaining):
-                    d = self.euclidean_dist(self.rooms[i], self.rooms[j])
-                    if d < best_dist:
-                        best_dist = d
-                        src_idx = i
-                        dst_idx = j
+        depth = [-1] * n
+        depth[0] = 0
+        queue = [0]
+        head = 0
+        while head < len(queue):
+            cur = queue[head]
+            head += 1
+            for nxt in adjacency[cur]:
+                if depth[nxt] >= 0:
+                    continue
+                depth[nxt] = depth[cur] + 1
+                queue.append(nxt)
 
-            carved, path, msg = self.draw_l_corridor(src_idx, dst_idx, True, path_buf)
-            pair = (min(src_idx, dst_idx), max(src_idx, dst_idx))
-            pair_already = pair in connected_pairs
-            connected_pairs.add(pair)
-            connected.add(dst_idx)
-            remaining.discard(dst_idx)
-            self.snapshot(
-                f"04-{debug_step:02d}. MST R{src_idx} -> R{dst_idx}",
-                path=path,
-                note=(
-                    f"Unity legacy ConnectAll MST | {msg} | "
-                    f"pairAdded={not pair_already} connectedAdd=R{dst_idx} remainingRemove=R{dst_idx}"
-                ),
-            )
+        start = self.rooms[0]
+        leaf_candidates = [i for i in range(1, n) if degree[i] == 1]
+        if not leaf_candidates:
+            return
 
-            if self.rng.next_double() < self.s.extra_conn_prob:
-                best_dist2 = float("inf")
-                best_k = -1
-                for k in range(n):
-                    if k == src_idx or k == dst_idx:
-                        continue
-                    pair2 = (min(src_idx, k), max(src_idx, k))
-                    if pair2 in connected_pairs:
-                        continue
-                    d = self.euclidean_dist(self.rooms[src_idx], self.rooms[k])
-                    if d < best_dist2:
-                        best_dist2 = d
-                        best_k = k
+        def dist_sq_from_start(idx: int) -> int:
+            r = self.rooms[idx]
+            dx = r.cx - start.cx
+            dy = r.cy - start.cy
+            return dx * dx + dy * dy
 
-                if best_k >= 0:
-                    extra_carved, extra_path, extra_msg = self.draw_l_corridor(src_idx, best_k, False, path_buf)
-                    extra_pair = (min(src_idx, best_k), max(src_idx, best_k))
-                    extra_pair_already = extra_pair in connected_pairs
-                    extra_dst_was_remaining = best_k in remaining
-                    connected_add = "none"
-                    remaining_remove = "none"
-                    if extra_carved:
-                        connected_pairs.add(extra_pair)
-                        if best_k in remaining:
-                            connected.add(best_k)
-                            remaining.remove(best_k)
-                            connected_add = f"R{best_k}"
-                            remaining_remove = f"R{best_k}"
-                    self.snapshot(
-                        f"04-{debug_step:02d}. EXTRA R{src_idx} -> R{best_k}",
-                        path=extra_path,
-                        note=(
-                            f"Unity legacy ConnectAll EXTRA | {extra_msg} | "
-                            f"carved={extra_carved} pairAdded={extra_carved and not extra_pair_already} "
-                            f"dstWasRemaining={extra_dst_was_remaining} "
-                            f"connectedAdd={connected_add} remainingRemove={remaining_remove}"
-                        ),
-                    )
-            else:
-                self.snapshot(
-                    f"04-{debug_step:02d}. EXTRA roll skip from R{src_idx}",
-                    note=f"rng.NextDouble() >= ExtraConnProb({self.s.extra_conn_prob})",
-                )
+        leaf_candidates.sort(key=lambda i: (-(depth[i] if depth[i] >= 0 else -999999), -dist_sq_from_start(i), i))
+        top_count = min(3, len(leaf_candidates))
+        selected = leaf_candidates[self.rng.next(top_count)]
+        self.elite_room_index = selected
+        rank_text = ", ".join(f"R{i}(depth={depth[i]},distSq={dist_sq_from_start(i)})" for i in leaf_candidates[:top_count])
+        self.snapshot(
+            f"04E. Elite Room 선택 R{selected}",
+            note=f"leaf candidates={len(leaf_candidates)} top{top_count}=[{rank_text}] selected=R{selected}; EXTRA candidates touching R{selected} will be skipped",
+        )
 
     def connect_extra_corridors(self, connected_pairs: Set[Tuple[int, int]], path_buf: List[Tuple[int, int]]) -> None:
         """Unity parity EXTRA flow.
@@ -587,6 +544,12 @@ class DungeonGenerator:
             for src_idx in range(n):
                 for dst_idx in range(src_idx + 1, n):
                     pair_key = (src_idx, dst_idx)
+                    if src_idx == self.elite_room_index or dst_idx == self.elite_room_index:
+                        self.snapshot(
+                            f"05-{attempt_idx + 1:02d}. pair R{src_idx} -> R{dst_idx} 스킵",
+                            note=f"attempt={attempt_idx} pair R{src_idx}->R{dst_idx} includes Elite Room R{self.elite_room_index}; EXTRA candidate generation skipped"
+                        )
+                        continue
                     if pair_key in connected_pairs:
                         skipped_connected_pairs += 1
                         self.snapshot(
@@ -1370,11 +1333,12 @@ class DungeonViewer(tk.Tk):
         CORRIDOR: "#b88a48",
         STAIR_UP: "#53d6ff",
         DOOR_CLOSED: "#8c5b2f",
+        ELITE_ROOM_MARKER: "#ff4fd8",
     }
 
     def __init__(self):
         super().__init__()
-        self.title("Proto_JBRL DungeonGenerate Simulator - Unity MST-then-EXTRA attempt parity build 2026-05-19 r14")
+        self.title("Proto_JBRL DungeonGenerate Simulator - Unity Elite Room parity build 2026-05-20 r16")
         self.geometry("1180x760")
         self.minsize(980, 660)
         self.steps: List[Step] = []
@@ -1708,8 +1672,11 @@ class DungeonViewer(tk.Tk):
                 rect_grid(node.x, node.y, node.w, node.h, "#3b4a66", 1)
 
         if show_rooms:
-            for r in step.rooms:
-                rect_grid(r.x, r.y, r.w, r.h, "#e8f1a1", 1)
+            for idx, r in enumerate(step.rooms):
+                if idx == step.elite_room_index:
+                    rect_grid(r.x, r.y, r.w, r.h, "#ff4fd8", 3)
+                else:
+                    rect_grid(r.x, r.y, r.w, r.h, "#e8f1a1", 1)
 
         if show_path and step.extra_paths:
             for candidate_path, color, label in step.extra_paths:
@@ -1761,14 +1728,16 @@ class DungeonViewer(tk.Tk):
 
         if self.show_rooms.get():
             for i, r in enumerate(step.rooms):
+                label = f"R{i}" if i != step.elite_room_index else f"R{i}\nELITE"
+                fill = "#ffffff" if i != step.elite_room_index else "#ffb3f0"
                 self.canvas.create_text(ox + r.cx * self.cell + self.cell // 2,
                                         oy + r.cy * self.cell + self.cell // 2,
-                                        text=f"R{i}", fill="#ffffff",
+                                        text=label, fill=fill,
                                         font=("Arial", max(7, self.cell), "bold"))
 
         legend_x = ox
         legend_y = oy + h * self.cell + 8
-        legend = [("EMPTY", EMPTY), ("ROOM", ROOM), ("CORRIDOR", CORRIDOR), ("STAIR_UP", STAIR_UP), ("selected path", -1), ("EXTRA candidates", -2)]
+        legend = [("EMPTY", EMPTY), ("ROOM", ROOM), ("ELITE", ELITE_ROOM_MARKER), ("CORRIDOR", CORRIDOR), ("STAIR_UP", STAIR_UP), ("selected path", -1), ("EXTRA candidates", -2)]
         lx = legend_x
         for name, tile in legend:
             if tile == -1:
