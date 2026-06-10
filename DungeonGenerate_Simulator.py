@@ -1,8 +1,8 @@
 """
-Proto_JBRL Dungeon Step Viewer - Elite floors parity fix 2026-05-20 r16
+Proto_JBRL Dungeon Step Viewer
 
 Python/Tkinter visualizer that ports the current Proto_JBRL DungeonGenerator flow:
-Seed+Floor -> BSP split -> room placement -> room fill -> MST corridors -> Elite leaf room selection -> pair-scored EXTRA corridor -> stair placement.
+Seed+Floor -> BSP split -> room placement -> room fill -> MST corridors -> pair-scored EXTRA corridor -> stair placement.
 
 Controls:
 - Enter seed and floor, then click Generate / Enter
@@ -14,7 +14,6 @@ This is a standalone visualization tool. It does not import Unity project files.
 
 Exact-match rule:
 - Use the same Seed/Floor and the same serialized DungeonSettings values as Unity.
-- SpawnRegion is not used for terrain generation. Terrain seed uses only Seed and Floor.
 - The generator logic and old System.Random behavior are ported so the dungeon grid should match
   the Unity map when those inputs match.
 """
@@ -32,8 +31,14 @@ EMPTY = 0
 ROOM = 1
 CORRIDOR = 2
 STAIR_UP = 3
-ELITE_ROOM_MARKER = 98
 DOOR_CLOSED = 5
+
+ROOM_TYPE_NORMAL = "Normal"
+ROOM_TYPE_STAIR = "Stair"
+ROOM_TYPE_MONSTER_DEN = "MonsterDen"
+SPAWN_REGION_DUNGEON = 1
+MONSTER_DEN_DOMAIN = "monster_den_select"
+
 
 
 # -----------------------------
@@ -43,10 +48,6 @@ INT_MIN = -2147483648
 INT_MAX = 2147483647
 MBIG = INT_MAX
 MSEED = 161803398
-
-
-def uint32(v: int) -> int:
-    return v & 0xFFFFFFFF
 
 
 def int32(v: int) -> int:
@@ -68,6 +69,55 @@ def unity_build_settings_seed_from_text(text: str) -> int:
     # The Inspector seed is a long, while DungeonSettings.Seed is int?.
     # Matching this fold is required for 12-digit Unity seeds to generate the same map.
     return int32(csharp_remainder(int(text.strip()), INT_MAX))
+
+
+def uint32(v: int) -> int:
+    return v & 0xFFFFFFFF
+
+
+def add_fnv_byte(hash_value: int, value: int) -> int:
+    hash_value ^= value & 0xFF
+    return uint32(hash_value * 16777619)
+
+
+def add_fnv_int(hash_value: int, value: int) -> int:
+    value = int32(value)
+    for shift in (0, 8, 16, 24):
+        hash_value = add_fnv_byte(hash_value, value >> shift)
+    return hash_value
+
+
+def add_fnv_long(hash_value: int, value: int) -> int:
+    # Mirrors DeterministicSeedUtility.AddLong: low 32 bits first, then high 32 bits.
+    value = int(value)
+    hash_value = add_fnv_int(hash_value, int32(value))
+    hash_value = add_fnv_int(hash_value, int32(value >> 32))
+    return hash_value
+
+
+def add_fnv_string(hash_value: int, value: str) -> int:
+    if not value:
+        return add_fnv_int(hash_value, 0)
+    hash_value = add_fnv_int(hash_value, len(value))
+    for ch in value:
+        hash_value = add_fnv_int(hash_value, ord(ch))
+    return hash_value
+
+
+def to_positive_seed(hash_value: int) -> int:
+    seed = hash_value & 0x7FFFFFFF
+    return 1 if seed == 0 else seed
+
+
+def deterministic_create_seed(global_seed: int, spawn_region: int, floor: int, stable_room_key: int, domain: str) -> int:
+    # Port of DeterministicSeedUtility.CreateSeed in DungeonTypes.cs.
+    h = 2166136261
+    h = add_fnv_long(h, global_seed)
+    h = add_fnv_int(h, spawn_region)
+    h = add_fnv_int(h, floor)
+    h = add_fnv_int(h, stable_room_key)
+    h = add_fnv_string(h, domain)
+    return to_positive_seed(h)
 
 
 class DotNetRandom:
@@ -163,6 +213,10 @@ class DungeonSettings:
     floor: int = 1
     max_floor: int = 100
     min_straight: int = 2
+    monster_den_chance: float = 0.05
+    max_monster_den_count: int = 1
+    source_seed_long: int = 0
+    spawn_region: int = SPAWN_REGION_DUNGEON
 
     def validate(self) -> None:
         if self.map_width < 10:
@@ -187,17 +241,16 @@ class DungeonSettings:
         self.extra_overlap_score_weight = max(0, self.extra_overlap_score_weight)
         self.extra_path_length_penalty_weight = max(0, self.extra_path_length_penalty_weight)
         self.extra_center_distance_penalty_divisor = max(1, self.extra_center_distance_penalty_divisor)
+        self.monster_den_chance = max(0.0, min(1.0, self.monster_den_chance))
+        self.max_monster_den_count = max(0, self.max_monster_den_count)
+        self.spawn_region = int(self.spawn_region)
 
     def derive_seed(self) -> int:
-        # Unity DungeonSettings.DeriveSeed() source-of-truth from the last supplied code:
-        #     int mixed = (s ^ (Floor * 2654435761u)) * 2246822519u;
-        #     return mixed & 0x7FFFFFFF;
-        # SpawnRegion is intentionally NOT included in terrain generation.
-        seed_value = self.seed if self.seed is not None else 0
-        s = uint32(seed_value)
-        floor_mix = uint32(self.floor * 2654435761)
-        mixed = uint32((s ^ floor_mix) * 2246822519)
-        return mixed & INT_MAX
+        s = self.seed if self.seed is not None else 0
+        a = int32(self.floor * int32(2654435761))
+        b = int32(s ^ a)
+        mixed = int32(b * int32(2246822519))
+        return mixed & 0x7FFFFFFF
 
 
 @dataclass
@@ -208,6 +261,8 @@ class Room:
     h: int
     cx: int
     cy: int
+    is_elite: bool = False
+    room_type: str = ROOM_TYPE_NORMAL
 
 
 @dataclass
@@ -250,7 +305,6 @@ class Step:
     path: List[Tuple[int, int]]
     note: str = ""
     extra_paths: Optional[List[Tuple[List[Tuple[int, int]], str, str]]] = None
-    elite_room_index: int = -1
 
 
 # -----------------------------
@@ -265,7 +319,6 @@ class DungeonGenerator:
         self.corridor_tiles: Set[Tuple[int, int]] = set()
         self.rooms: List[Room] = []
         self.steps: List[Step] = []
-        self.elite_room_index: int = -1
         self.nodes: List[BSPNode] = []
 
     def snapshot(
@@ -279,7 +332,8 @@ class DungeonGenerator:
         copied_extra_paths = None
         if extra_paths:
             copied_extra_paths = [(list(candidate_path), color, label) for candidate_path, color, label in extra_paths]
-        self.steps.append(Step(title, copied_grid, self.rooms[:], self.nodes[:], list(path or []), note, copied_extra_paths, self.elite_room_index))
+        copied_rooms = [Room(r.x, r.y, r.w, r.h, r.cx, r.cy, r.is_elite, r.room_type) for r in self.rooms]
+        self.steps.append(Step(title, copied_grid, copied_rooms, self.nodes[:], list(path or []), note, copied_extra_paths))
 
     @staticmethod
     def extra_candidate_color(index: int) -> str:
@@ -330,10 +384,9 @@ class DungeonGenerator:
         for i, room in enumerate(self.rooms):
             self.fill_room(room)
             self.snapshot(f"03-{i+1:02d}. 방 바닥 채우기 R{i}")
-        connected_pairs, mst_edges = self.connect_mst_all()
-        self.assign_elite_room(mst_edges)
-        self.connect_extra_corridors(connected_pairs, [])
+        self.connect_all()
         self.place_stairs()
+        self.assign_monster_dens()
         self.snapshot("99. 최종 던전")
         return self.steps
 
@@ -397,121 +450,57 @@ class DungeonGenerator:
             for x in range(room.x, room.x + room.w):
                 self.grid[y][x] = ROOM
 
+    def connect_all(self) -> None:
+        n = len(self.rooms)
+        if n < 2:
+            return
 
-    def connect_mst_all(self) -> Tuple[Set[Tuple[int, int]], List[Tuple[int, int]]]:
-        connected_pairs: Set[Tuple[int, int]] = set()
+        connected: Set[int] = {0}
+        remaining: Set[int] = set(range(1, n))
+        # C# HashSet iteration parity note: the project previously relied on
+        # insertion-shaped traversal. This viewer keeps explicit deterministic
+        # lists for stable tie behavior.
+        connected_order: List[int] = [0]
+        remaining_order: List[int] = list(range(1, n))
+        mst_pairs: Set[Tuple[int, int]] = set()
         mst_edges: List[Tuple[int, int]] = []
         path_buf: List[Tuple[int, int]] = []
-        n = len(self.rooms)
-        if n <= 1:
-            return connected_pairs, path_buf
+        edge_index = 0
 
-        connected = {0}
-        remaining = set(range(1, n))
-        step = 0
+        # Phase 1: MST only. EXTRA corridors no longer modify connected/remaining.
         while remaining:
-            best: Optional[Tuple[int, int, int]] = None
-            for a in connected:
-                for b in remaining:
-                    da = self.rooms[a]
-                    db = self.rooms[b]
-                    dist = (da.cx - db.cx) * (da.cx - db.cx) + (da.cy - db.cy) * (da.cy - db.cy)
-                    if best is None or dist < best[0] or (dist == best[0] and (a, b) < (best[1], best[2])):
-                        best = (dist, a, b)
-            assert best is not None
-            _, a, b = best
-            carved, path_buf, carve_reason = self.draw_l_corridor(a, b, True, path_buf)
-            connected_pairs.add((a, b) if a < b else (b, a))
-            mst_edges.append((a, b))
-            connected.add(b)
-            remaining.remove(b)
-            step += 1
-            self.snapshot(f"04-{step:02d}. MST 통로 R{a} -> R{b}", path_buf,
-                          note=f"MST distanceSq={best[0]}; remaining={len(remaining)}")
+            best_dist = float("inf")
+            src_idx = -1
+            dst_idx = -1
+            for i in connected_order:
+                for j in remaining_order:
+                    if j not in remaining:
+                        continue
+                    d = self.euclidean_dist(self.rooms[i], self.rooms[j])
+                    if d < best_dist:
+                        best_dist = d
+                        src_idx, dst_idx = i, j
 
-        return connected_pairs, mst_edges
+            carved, path, note = self.draw_l_corridor(src_idx, dst_idx, True, path_buf)
+            edge_index += 1
+            self.snapshot(f"04-{edge_index:02d}. MST 통로 R{src_idx} -> R{dst_idx}", path, note)
 
-    def assign_elite_room(self, mst_edges: List[Tuple[int, int]]) -> None:
-        """Unity parity: after MST, deterministically pick one leaf room as Elite Room.
+            mst_pairs.add((min(src_idx, dst_idx), max(src_idx, dst_idx)))
+            mst_edges.append((src_idx, dst_idx))
+            if dst_idx not in connected:
+                connected_order.append(dst_idx)
+            connected.add(dst_idx)
+            remaining.remove(dst_idx)
 
-        Leaf means MST degree == 1. Candidates are ranked by:
-        1) deeper MST depth from R0 first,
-        2) farther squared distance from R0 first,
-        3) smaller room index first.
+        elite_room_index = self.assign_elite_room(mst_edges)
 
-        Important parity detail: current Unity code does NOT consume the dungeon
-        System.Random stream for Elite Room selection. Consuming RNG here shifts
-        all following EXTRA corridor rolls/candidates and stair room placement.
-        """
-        self.elite_room_index = -1
+        # Phase 2: Unity latest flow. After every MST edge has been carved,
+        # run up to rooms.Count - 1 EXTRA attempts. EXTRA never mutates
+        # connected/remaining; it only adds selected room pairs to connectedPairs.
+        self.connect_extra_corridors(mst_pairs, path_buf, elite_room_index)
 
-        # Unity rule: Elite Room exists only on floors whose ones digit is 5
-        # (5F, 15F, 25F, 35F, 45F, ...).
-        # Non-elite floors must not consume the RNG stream here, otherwise EXTRA
-        # corridor and stair placement diverge from Unity.
-        if self.s.floor % 10 != 5:
-            self.snapshot(
-                "04E. Elite Room 없음",
-                note=f"floor={self.s.floor}; elite room only appears on floors ending with 5; RNG not consumed",
-            )
-            return
-
-        n = len(self.rooms)
-        if n <= 1:
-            return
-
-        adjacency = [[] for _ in range(n)]
-        degree = [0] * n
-        for a, b in mst_edges:
-            if 0 <= a < n and 0 <= b < n:
-                adjacency[a].append(b)
-                adjacency[b].append(a)
-                degree[a] += 1
-                degree[b] += 1
-
-        # Unity-like BFS from R0 over the MST tree. The adjacency append order is
-        # the MST carve order, so keep it untouched for tie stability.
-        depth = [-1] * n
-        depth[0] = 0
-        queue = [0]
-        head = 0
-        while head < len(queue):
-            cur = queue[head]
-            head += 1
-            for nxt in adjacency[cur]:
-                if depth[nxt] >= 0:
-                    continue
-                depth[nxt] = depth[cur] + 1
-                queue.append(nxt)
-
-        start = self.rooms[0]
-        leaf_candidates = [i for i in range(1, n) if degree[i] == 1]
-        if not leaf_candidates:
-            self.snapshot("04E. Elite Room 후보 없음", note="no MST leaf candidates except R0; RNG not consumed")
-            return
-
-        def dist_sq_from_start(idx: int) -> int:
-            r = self.rooms[idx]
-            dx = r.cx - start.cx
-            dy = r.cy - start.cy
-            return dx * dx + dy * dy
-
-        leaf_candidates.sort(key=lambda i: (-(depth[i] if depth[i] >= 0 else -999999), -dist_sq_from_start(i), i))
-        selected = leaf_candidates[0]
-        self.elite_room_index = selected
-        rank_text = ", ".join(f"R{i}(depth={depth[i]},distSq={dist_sq_from_start(i)})" for i in leaf_candidates)
-        self.snapshot(
-            f"04E. Elite Room 선택 R{selected}",
-            note=f"leaf candidates={len(leaf_candidates)} ranked=[{rank_text}] selected=R{selected}; deterministic selection; RNG not consumed; EXTRA candidates touching R{selected} will be skipped",
-        )
-
-    def connect_extra_corridors(self, connected_pairs: Set[Tuple[int, int]], path_buf: List[Tuple[int, int]]) -> None:
-        """Unity parity EXTRA flow.
-
-        MST is finished first. EXTRA then runs rooms.Count - 1 attempts.
-        Each passed attempt reviews every currently unconnected room pair, keeps one
-        best candidate per pair, then carves one final best path for that attempt.
-        """
+    def connect_extra_corridors(self, connected_pairs: Set[Tuple[int, int]], path_buf: List[Tuple[int, int]], elite_room_index: int = -1) -> None:
+        """Unity latest EXTRA flow: attempt-based full unordered room-pair sweep."""
         n = len(self.rooms)
         if n < 2:
             return
@@ -522,43 +511,46 @@ class DungeonGenerator:
             self.snapshot("05. EXTRA 후보 검토 생략", note="ExtraCandidateCount <= 0")
             return
 
-        pair_candidates: List[ExtraCorridorCandidate] = []
-        all_pair_bests: List[ExtraCorridorCandidate] = []
         carved_count = 0
+        max_attempts = max(0, n - 1)
+        pair_candidates: List[ExtraCorridorCandidate] = []
+        pair_best_candidates: List[ExtraCorridorCandidate] = []
 
-        for attempt_idx in range(n - 1):
+        for attempt_idx in range(max_attempts):
             roll = self.rng.next_double()
             if roll >= self.s.extra_conn_prob:
                 self.snapshot(
-                    f"05-{attempt_idx + 1:02d}. EXTRA 생성 체크: 스킵",
+                    f"05-A{attempt_idx:02d}. EXTRA attempt 스킵",
                     note=f"attempt={attempt_idx} roll={roll:.6f} >= ExtraConnProb={self.s.extra_conn_prob}"
                 )
                 continue
 
             self.snapshot(
-                f"05-{attempt_idx + 1:02d}. EXTRA 생성 체크: 진행",
+                f"05-A{attempt_idx:02d}. EXTRA attempt 시작 - 전체 room pair sweep",
                 note=f"attempt={attempt_idx} roll={roll:.6f} < ExtraConnProb={self.s.extra_conn_prob}"
             )
 
-            all_pair_bests.clear()
+            pair_best_candidates.clear()
             checked_pairs = 0
             skipped_connected_pairs = 0
+            skipped_elite_pairs = 0
             rejected_total = 0
 
-            for src_idx in range(n):
+            for src_idx in range(n - 1):
                 for dst_idx in range(src_idx + 1, n):
                     pair_key = (src_idx, dst_idx)
-                    if src_idx == self.elite_room_index or dst_idx == self.elite_room_index:
-                        self.snapshot(
-                            f"05-{attempt_idx + 1:02d}. pair R{src_idx} -> R{dst_idx} 스킵",
-                            note=f"attempt={attempt_idx} pair R{src_idx}->R{dst_idx} includes Elite Room R{self.elite_room_index}; EXTRA candidate generation skipped"
-                        )
-                        continue
                     if pair_key in connected_pairs:
                         skipped_connected_pairs += 1
                         self.snapshot(
-                            f"05-{attempt_idx + 1:02d}. pair R{src_idx} -> R{dst_idx} 스킵",
-                            note=f"attempt={attempt_idx} pair R{src_idx}->R{dst_idx} already connected by MST or earlier EXTRA"
+                            f"05-A{attempt_idx:02d}. pair R{src_idx} -> R{dst_idx} 스킵",
+                            note=f"attempt={attempt_idx} pair already connected by MST or earlier EXTRA"
+                        )
+                        continue
+                    if src_idx == elite_room_index or dst_idx == elite_room_index:
+                        skipped_elite_pairs += 1
+                        self.snapshot(
+                            f"05-A{attempt_idx:02d}. pair R{src_idx} -> R{dst_idx} 스킵",
+                            note=f"attempt={attempt_idx} pair contains Elite Room R{elite_room_index}"
                         )
                         continue
 
@@ -580,11 +572,11 @@ class DungeonGenerator:
                             note += "\n" + "\n".join(rejected_notes[:10])
                             if len(rejected_notes) > 10:
                                 note += f"\n... rejected {len(rejected_notes) - 10} more"
-                        self.snapshot(f"05-{attempt_idx + 1:02d}. R{src_idx} -> R{dst_idx} 후보 없음", note=note)
+                        self.snapshot(f"05-A{attempt_idx:02d}. R{src_idx} -> R{dst_idx} 후보 없음", note=note)
                         continue
 
                     pair_best = self.select_best_extra_corridor_candidate(pair_candidates)
-                    all_pair_bests.append(pair_best)
+                    pair_best_candidates.append(pair_best)
                     overlays = self.build_extra_candidate_overlays(pair_candidates, pair_best)
                     note = (
                         f"attempt={attempt_idx} pair=R{src_idx}->R{dst_idx} "
@@ -601,47 +593,48 @@ class DungeonGenerator:
                         if len(rejected_notes) > 8:
                             note += f"\n... rejected {len(rejected_notes) - 8} more"
                     self.snapshot(
-                        f"05-{attempt_idx + 1:02d}. R{src_idx} -> R{dst_idx} 후보군 + pair best",
+                        f"05-A{attempt_idx:02d}. R{src_idx} -> R{dst_idx} 후보군 + pair best",
                         pair_best.path, note, extra_paths=overlays
                     )
 
-            if not all_pair_bests:
+            if not pair_best_candidates:
                 self.snapshot(
-                    f"05-{attempt_idx + 1:02d}. EXTRA 선택 없음",
+                    f"05-A{attempt_idx:02d}. EXTRA 선택 없음",
                     note=(
                         f"attempt={attempt_idx} checked_pairs={checked_pairs} "
-                        f"skipped_connected_pairs={skipped_connected_pairs} rejected={rejected_total} "
+                        f"skipped_connected_pairs={skipped_connected_pairs} "
+                        f"skipped_elite_pairs={skipped_elite_pairs} rejected={rejected_total} "
                         "pairBestCandidates=0"
                     )
                 )
                 continue
 
-            selected = self.select_best_extra_corridor_candidate(all_pair_bests)
-            summary_overlays = self.build_extra_candidate_overlays(all_pair_bests, selected)
+            selected = self.select_best_extra_corridor_candidate(pair_best_candidates)
+            summary_overlays = self.build_extra_candidate_overlays(pair_best_candidates, selected)
             summary_note = (
                 f"attempt={attempt_idx} final selected R{selected.src_idx}->{selected.dst_idx} "
                 f"candidate={selected.candidate_index} score={selected.score} "
-                f"pairBestCount={len(all_pair_bests)} checked_pairs={checked_pairs} "
-                f"skipped_connected_pairs={skipped_connected_pairs} cells={selected.path_len} "
-                f"overlap={selected.overlap} parallel={selected.parallel_run} "
+                f"pairBestCount={len(pair_best_candidates)} checked_pairs={checked_pairs} "
+                f"skipped_connected_pairs={skipped_connected_pairs} skipped_elite_pairs={skipped_elite_pairs} "
+                f"cells={selected.path_len} overlap={selected.overlap} parallel={selected.parallel_run} "
                 f"centerDistSq={selected.center_dist_sq}"
             )
             self.snapshot(
-                f"05-{attempt_idx + 1:02d}. EXTRA pair-best 후보군 + 최종 best",
+                f"05-A{attempt_idx:02d}. 전체 pair-best 후보군 + attempt 최종 best",
                 selected.path, summary_note, extra_paths=summary_overlays
             )
 
             self.carve_path(selected.path)
-            connected_pairs.add((min(selected.src_idx, selected.dst_idx), max(selected.src_idx, selected.dst_idx)))
+            connected_pairs.add((selected.src_idx, selected.dst_idx))
             carved_count += 1
             self.snapshot(
-                f"05-{attempt_idx + 1:02d}. EXTRA 통로 생성 R{selected.src_idx} -> R{selected.dst_idx}",
+                f"05-A{attempt_idx:02d}. EXTRA 통로 생성 R{selected.src_idx} -> R{selected.dst_idx}",
                 selected.path,
                 note=f"carvedExtrasSoFar={carved_count} selectedScore={selected.score} selectedCells={selected.path_len}"
             )
 
         if carved_count == 0:
-            self.snapshot("05. EXTRA 최종 결과", note=f"carved=0 attempts={n - 1}")
+            self.snapshot("05. EXTRA 최종 결과", note=f"carved=0 attempts={max_attempts}")
 
     def build_extra_path_candidates_for_pair(
         self,
@@ -939,12 +932,15 @@ class DungeonGenerator:
         return False, alternate_path, f"carve=SKIP(primary={primary_reject}, alternate={alternate_reject}, extra)"
 
     def emit_l_corridor_path(self, src: Room, dst: Room, horiz_first: bool, path: List[Tuple[int, int]]) -> None:
-        # Current Unity path emission: room-border anchor cells stay ROOM;
-        # corridor cells start outside the room perimeter, and side axes are
-        # clamped away from room corners when the side has interior cells.
         path.clear()
         MIN = self.s.min_straight
+        dx = dst.cx - src.cx
+        dy = dst.cy - src.cy
         if horiz_first:
+            if dx >= 0:
+                door_sx, far_sx, door_ex, far_ex, step_s, step_e = src.x + src.w - 1, src.x + src.w + MIN - 1, dst.x, dst.x - MIN, 1, -1
+            else:
+                door_sx, far_sx, door_ex, far_ex, step_s, step_e = src.x, src.x - MIN, dst.x + dst.w - 1, dst.x + dst.w + MIN - 1, -1, 1
             sy, ey = src.cy, dst.cy
             if abs(sy - ey) < MIN:
                 used, sy2, ey2 = self.try_use_shared_door_axis(src.y, src.y + src.h, dst.y, dst.y + dst.h, sy)
@@ -955,8 +951,21 @@ class DungeonGenerator:
                     ey = max(dst.y, min(dst.y + dst.h - 1, sy + ey_dir * MIN))
                     if abs(sy - ey) < MIN:
                         sy = max(src.y, min(src.y + src.h - 1, ey - ey_dir * MIN))
-            self.emit_l_corridor_path_with_axes(src, dst, True, sy, ey, path)
+            sy = self.clamp_door_axis(sy, src.y, src.y + src.h)
+            ey = self.clamp_door_axis(ey, dst.y, dst.y + dst.h)
+            if src.x <= far_ex <= src.x + src.w - 1:
+                self.emit_h(door_ex + step_e, far_ex, ey, path)
+                self.emit_v(sy, ey, far_ex, path)
+            else:
+                self.emit_h(door_sx + step_s, far_sx, sy, path)
+                self.emit_h(door_ex + step_e, far_ex, ey, path)
+                self.emit_h(far_sx, far_ex, sy, path)
+                self.emit_v(sy, ey, far_ex, path)
         else:
+            if dy >= 0:
+                door_sy, far_sy, door_ey, far_ey, step_s, step_e = src.y + src.h - 1, src.y + src.h + MIN - 1, dst.y, dst.y - MIN, 1, -1
+            else:
+                door_sy, far_sy, door_ey, far_ey, step_s, step_e = src.y, src.y - MIN, dst.y + dst.h - 1, dst.y + dst.h + MIN - 1, -1, 1
             sx, ex = src.cx, dst.cx
             if abs(sx - ex) < MIN:
                 used, sx2, ex2 = self.try_use_shared_door_axis(src.x, src.x + src.w, dst.x, dst.x + dst.w, sx)
@@ -967,7 +976,16 @@ class DungeonGenerator:
                     ex = max(dst.x, min(dst.x + dst.w - 1, sx + ex_dir * MIN))
                     if abs(sx - ex) < MIN:
                         sx = max(src.x, min(src.x + src.w - 1, ex - ex_dir * MIN))
-            self.emit_l_corridor_path_with_axes(src, dst, False, sx, ex, path)
+            sx = self.clamp_door_axis(sx, src.x, src.x + src.w)
+            ex = self.clamp_door_axis(ex, dst.x, dst.x + dst.w)
+            if src.y <= far_ey <= src.y + src.h - 1:
+                self.emit_v(door_ey + step_e, far_ey, ex, path)
+                self.emit_h(sx, ex, far_ey, path)
+            else:
+                self.emit_v(door_sy + step_s, far_sy, sx, path)
+                self.emit_v(door_ey + step_e, far_ey, ex, path)
+                self.emit_v(far_sy, far_ey, sx, path)
+                self.emit_h(sx, ex, far_ey, path)
 
     @staticmethod
     def emit_h(x0: int, x1: int, y: int, path: List[Tuple[int, int]]) -> None:
@@ -1017,20 +1035,22 @@ class DungeonGenerator:
         return self.corridor_candidate_reject_reason(path, src_idx, dst_idx, is_mandatory) is None
 
     def corridor_candidate_reject_reason(self, path: List[Tuple[int, int]], src_idx: int, dst_idx: int, is_mandatory: bool) -> Optional[str]:
+        # Mirrors current DungeonGenerator.IsCorridorCandidateClean ordering.
+        # Room-perimeter/corner-doorway checks are EXTRA-only for connectivity safety.
+        if not is_mandatory and self.path_carves_room_perimeter(path, src_idx, dst_idx):
+            return "room-perimeter-corridor"
+        if not is_mandatory and self.path_uses_room_corner_doorway(path, src_idx, dst_idx):
+            return "corner-doorway"
         if self.path_hits_third_room(path, src_idx, dst_idx):
             return "third-room"
         if self.path_creates_bad_door_run(path):
             return "bad-door-run"
         if self.path_creates_orphan_door_stub(path):
             return "orphan-door-stub"
-        if not is_mandatory and self.path_carves_room_perimeter(path, src_idx, dst_idx):
-            return "room-perimeter-corridor"
-        if not is_mandatory and self.path_uses_room_corner_doorway(path, src_idx, dst_idx):
-            return "corner-doorway"
-        if not is_mandatory and self.path_creates_diagonal_room_stub(path, src_idx, dst_idx):
-            return "diagonal-room-stub"
         if not is_mandatory and self.path_creates_outward_room_stub(path, src_idx, dst_idx):
             return "outward-room-stub"
+        if not is_mandatory and self.path_creates_diagonal_room_stub(path, src_idx, dst_idx):
+            return "diagonal-room-stub"
         if not is_mandatory and self.path_creates_third_room_parallel_run(path, src_idx, dst_idx):
             return "third-room-parallel"
         return None
@@ -1290,6 +1310,167 @@ class DungeonGenerator:
     def in_bounds(self, x: int, y: int) -> bool:
         return 0 <= x < self.s.map_width and 0 <= y < self.s.map_height
 
+    def is_elite_floor(self) -> bool:
+        return self.s.floor > 0 and self.s.floor % 10 == 5
+
+    def assign_elite_room(self, mst_edges: List[Tuple[int, int]]) -> int:
+        if not self.is_elite_floor():
+            return -1
+        n = len(self.rooms)
+        if n < 2:
+            self.snapshot("04-E. Elite Room 선택 실패", note="Elite floor has fewer than two rooms")
+            return -1
+        degree = [0 for _ in range(n)]
+        depth = [-1 for _ in range(n)]
+        for a, b in mst_edges:
+            degree[a] += 1
+            degree[b] += 1
+        self.build_mst_depths(n, mst_edges, depth)
+        best = -1
+        for i in range(1, n):
+            if degree[i] != 1:
+                continue
+            if self.is_better_elite_room_candidate(depth, i, best):
+                best = i
+        warning = ""
+        if best < 0:
+            warning = "No MST leaf room was found; using farthest non-start room as elite fallback."
+            for i in range(1, n):
+                if self.is_better_elite_room_candidate(depth, i, best):
+                    best = i
+        if best < 0:
+            self.snapshot("04-E. Elite Room 선택 실패", note="Elite room assignment failed; no non-start room exists.")
+            return -1
+        self.rooms[best].is_elite = True
+        note = f"EliteRoom=R{best} depth={depth[best]} distSqFromStart={self.center_dist_sq(self.rooms[0], self.rooms[best])}"
+        if warning:
+            note += "\n" + warning
+        self.snapshot(f"04-E. Elite Room 선택 R{best}", note=note)
+        return best
+
+    @staticmethod
+    def build_mst_depths(room_count: int, mst_edges: List[Tuple[int, int]], depth: List[int]) -> None:
+        queue: List[int] = [0]
+        depth[0] = 0
+        head = 0
+        while head < len(queue):
+            current = queue[head]
+            head += 1
+            for a, b in mst_edges:
+                next_idx = -1
+                if a == current:
+                    next_idx = b
+                elif b == current:
+                    next_idx = a
+                if next_idx < 0 or next_idx >= room_count or depth[next_idx] >= 0:
+                    continue
+                depth[next_idx] = depth[current] + 1
+                queue.append(next_idx)
+
+    def is_better_elite_room_candidate(self, depth: List[int], candidate: int, best: int) -> bool:
+        if best < 0:
+            return True
+        if depth[candidate] != depth[best]:
+            return depth[candidate] > depth[best]
+        candidate_distance = self.center_dist_sq(self.rooms[0], self.rooms[candidate])
+        best_distance = self.center_dist_sq(self.rooms[0], self.rooms[best])
+        if candidate_distance != best_distance:
+            return candidate_distance > best_distance
+        return candidate < best
+
+    def assign_monster_dens(self) -> None:
+        # Unity pipeline: Registry.Initialize(data) marks Stair first, then spawn room is found,
+        # then AssignMonsterDens(data, denRng, chance, maxCount, excludeSpawnKey) runs.
+        for room in self.rooms:
+            room.room_type = ROOM_TYPE_NORMAL
+        stair_room_index = self.find_room_containing_tile(STAIR_UP)
+        if stair_room_index >= 0:
+            self.rooms[stair_room_index].room_type = ROOM_TYPE_STAIR
+
+        spawn_pos = self.compute_spawn_pos()
+        spawn_room_index = self.find_room_containing_cell(*spawn_pos) if spawn_pos is not None else -1
+        exclude_spawn_key = None
+        if spawn_room_index >= 0:
+            spawn_room = self.rooms[spawn_room_index]
+            exclude_spawn_key = (spawn_room.x, spawn_room.y)
+
+        if self.s.max_monster_den_count <= 0:
+            self.snapshot("07. MonsterDen 지정 생략", note="Max MonsterDen Count <= 0")
+            return
+
+        den_seed = deterministic_create_seed(
+            self.s.source_seed_long,
+            self.s.spawn_region,
+            self.s.floor,
+            0,
+            MONSTER_DEN_DOMAIN,
+        )
+        den_rng = DotNetRandom(den_seed)
+        candidates: List[int] = []
+        for i, room in enumerate(self.rooms):
+            key = (room.x, room.y)
+            if room.room_type == ROOM_TYPE_NORMAL and not room.is_elite and key != exclude_spawn_key:
+                candidates.append(i)
+
+        selected: List[int] = []
+        roll_notes: List[str] = []
+        for attempt in range(self.s.max_monster_den_count):
+            if not candidates:
+                break
+            roll = den_rng.next_double()
+            if roll >= self.s.monster_den_chance:
+                roll_notes.append(f"attempt={attempt} roll={roll:.6f} >= chance={self.s.monster_den_chance}: skip")
+                continue
+            selected_index = den_rng.next(len(candidates))
+            room_index = candidates.pop(selected_index)
+            self.rooms[room_index].room_type = ROOM_TYPE_MONSTER_DEN
+            selected.append(room_index)
+            roll_notes.append(f"attempt={attempt} roll={roll:.6f} < chance={self.s.monster_den_chance}: R{room_index}")
+
+        note = (
+            f"denSeed={den_seed} chance={self.s.monster_den_chance} maxCount={self.s.max_monster_den_count} "
+            f"spawnRoom=R{spawn_room_index if spawn_room_index >= 0 else 'none'} "
+            f"stairRoom=R{stair_room_index if stair_room_index >= 0 else 'none'} "
+            f"selected={','.join('R'+str(i) for i in selected) if selected else 'none'}"
+        )
+        if roll_notes:
+            note += "\n" + "\n".join(roll_notes)
+        self.snapshot("07. MonsterDen 지정", note=note)
+
+    def compute_spawn_pos(self) -> Optional[Tuple[int, int]]:
+        mid_x = self.s.map_width // 2
+        mid_y = self.s.map_height // 2
+        best_dist = 2**31 - 1
+        spawn_col, spawn_row = mid_x, mid_y
+        found = False
+        for row in range(self.s.map_height):
+            for col in range(self.s.map_width):
+                if self.grid[row][col] != ROOM:
+                    continue
+                dist = abs(col - mid_x) + abs(row - mid_y)
+                if dist >= best_dist:
+                    continue
+                best_dist = dist
+                spawn_col, spawn_row = col, row
+                found = True
+        return (spawn_col, spawn_row) if found else None
+
+    def find_room_containing_cell(self, x: int, y: int) -> int:
+        for i, room in enumerate(self.rooms):
+            if room.x <= x < room.x + room.w and room.y <= y < room.y + room.h:
+                return i
+        return -1
+
+    def find_room_containing_tile(self, tile: int) -> int:
+        for row in range(self.s.map_height):
+            for col in range(self.s.map_width):
+                if self.grid[row][col] != tile:
+                    continue
+                idx = self.find_room_containing_cell(col, row)
+                if idx >= 0:
+                    return idx
+        return -1
+
     def place_stairs(self) -> None:
         if not self.rooms or self.s.floor >= self.s.max_floor:
             return
@@ -1337,12 +1518,11 @@ class DungeonViewer(tk.Tk):
         CORRIDOR: "#b88a48",
         STAIR_UP: "#53d6ff",
         DOOR_CLOSED: "#8c5b2f",
-        ELITE_ROOM_MARKER: "#ff4fd8",
     }
 
     def __init__(self):
         super().__init__()
-        self.title("Proto_JBRL DungeonGenerate Simulator - Unity Elite Room deterministic parity build 2026-05-20 r17")
+        self.title("Proto_JBRL DungeonGenerate Simulator - Stub removal parity build 2026-06-10 r20")
         self.geometry("1180x760")
         self.minsize(980, 660)
         self.steps: List[Step] = []
@@ -1372,6 +1552,8 @@ class DungeonViewer(tk.Tk):
         self.extra_center_dist_divisor_var = tk.StringVar(value="20")
         self.min_straight_var = tk.StringVar(value="2")
         self.max_floor_var = tk.StringVar(value="100")
+        self.monster_den_chance_var = tk.StringVar(value="0.05")
+        self.max_monster_den_count_var = tk.StringVar(value="1")
         self.status_var = tk.StringVar(value="")
         self.is_playing = False
         self.play_delay_ms = 180
@@ -1430,6 +1612,8 @@ class DungeonViewer(tk.Tk):
         self._add_labeled_entry(settings_row3, "Extra Center Distance Penalty Divisor", self.extra_center_dist_divisor_var, 4)
         self._add_labeled_entry(settings_row3, "MinStraight", self.min_straight_var, 4)
         self._add_labeled_entry(settings_row3, "MaxFloor", self.max_floor_var, 5)
+        self._add_labeled_entry(settings_row3, "MonsterDen Chance", self.monster_den_chance_var, 5)
+        self._add_labeled_entry(settings_row3, "Max MonsterDen Count", self.max_monster_den_count_var, 4)
 
         self.canvas = tk.Canvas(self, bg="#1b1d22", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
@@ -1455,6 +1639,7 @@ class DungeonViewer(tk.Tk):
         self.stop_playback()
         try:
             seed_text = self.seed_var.get().strip()
+            source_seed_long = int(seed_text) if seed_text else 0
             seed = unity_build_settings_seed_from_text(seed_text) if seed_text else None
             floor = int(self.floor_var.get().strip())
             settings = DungeonSettings(
@@ -1471,6 +1656,10 @@ class DungeonViewer(tk.Tk):
                 extra_center_distance_penalty_divisor=int(self.extra_center_dist_divisor_var.get().strip()),
                 min_straight=int(self.min_straight_var.get().strip()),
                 max_floor=int(self.max_floor_var.get().strip()),
+                monster_den_chance=float(self.monster_den_chance_var.get().strip()),
+                max_monster_den_count=int(self.max_monster_den_count_var.get().strip()),
+                source_seed_long=source_seed_long,
+                spawn_region=SPAWN_REGION_DUNGEON,
                 seed=seed,
                 floor=floor,
             )
@@ -1676,11 +1865,10 @@ class DungeonViewer(tk.Tk):
                 rect_grid(node.x, node.y, node.w, node.h, "#3b4a66", 1)
 
         if show_rooms:
-            for idx, r in enumerate(step.rooms):
-                if idx == step.elite_room_index:
-                    rect_grid(r.x, r.y, r.w, r.h, "#ff4fd8", 3)
-                else:
-                    rect_grid(r.x, r.y, r.w, r.h, "#e8f1a1", 1)
+            for r in step.rooms:
+                room_outline = "#ff4fd8" if r.room_type == ROOM_TYPE_MONSTER_DEN else ("#ff6b6b" if r.is_elite else "#e8f1a1")
+                room_width = 2 if r.room_type == ROOM_TYPE_MONSTER_DEN or r.is_elite else 1
+                rect_grid(r.x, r.y, r.w, r.h, room_outline, room_width)
 
         if show_path and step.extra_paths:
             for candidate_path, color, label in step.extra_paths:
@@ -1732,22 +1920,32 @@ class DungeonViewer(tk.Tk):
 
         if self.show_rooms.get():
             for i, r in enumerate(step.rooms):
-                label = f"R{i}" if i != step.elite_room_index else f"R{i}\nELITE"
-                fill = "#ffffff" if i != step.elite_room_index else "#ffb3f0"
+                label = f"R{i}"
+                fill = "#ffffff"
+                if r.room_type == ROOM_TYPE_MONSTER_DEN:
+                    label += "\nDEN"
+                    fill = "#ff4fd8"
+                elif r.is_elite:
+                    label += "\nELITE"
+                    fill = "#ff6b6b"
                 self.canvas.create_text(ox + r.cx * self.cell + self.cell // 2,
                                         oy + r.cy * self.cell + self.cell // 2,
-                                        text=label, fill=fill,
+                                        text=label, fill=fill, justify=tk.CENTER,
                                         font=("Arial", max(7, self.cell), "bold"))
 
         legend_x = ox
         legend_y = oy + h * self.cell + 8
-        legend = [("EMPTY", EMPTY), ("ROOM", ROOM), ("ELITE", ELITE_ROOM_MARKER), ("CORRIDOR", CORRIDOR), ("STAIR_UP", STAIR_UP), ("selected path", -1), ("EXTRA candidates", -2)]
+        legend = [("EMPTY", EMPTY), ("ROOM", ROOM), ("CORRIDOR", CORRIDOR), ("STAIR_UP", STAIR_UP), ("MonsterDen", -3), ("Elite", -4), ("selected path", -1), ("EXTRA candidates", -2)]
         lx = legend_x
         for name, tile in legend:
             if tile == -1:
                 color = "#ff3b30"
             elif tile == -2:
                 color = "#00e5ff"
+            elif tile == -3:
+                color = "#ff4fd8"
+            elif tile == -4:
+                color = "#ff6b6b"
             else:
                 color = self.COLORS[tile]
             self.canvas.create_rectangle(lx, legend_y, lx + 12, legend_y + 12, outline="", fill=color)
