@@ -56,27 +56,62 @@ def csharp_remainder(a: int, b: int) -> int:
     return a - q * b
 
 
-def fnv1a_32_ints_and_string(seed: int, floor: int, region: int, domain: str) -> int:
-    h = 2166136261
+# Deterministic domain seeds (monster den / stair) must be byte-for-byte identical to
+# DeterministicSeedUtility.CreateSeed(long globalSeed, int spawnRegion, int floor,
+#                                     int stableRoomKey, string spawnDomain).
+# IMPORTANT parity details versus the previous approximate helper:
+#   - globalSeed is hashed as a C# long (AddLong): low int first, then high int.
+#     This uses the RAW inspector seed (DungeonManager.seed), NOT the folded int
+#     used for geometry (DungeonSettings.Seed).
+#   - spawnRegion is the actual SpawnRegion value (Dungeon = 1), not 0.
+#   - AddString writes the length as an int, then each UTF-16 char as a full int
+#     (4 bytes), not 2 raw bytes.
+#   - ToPositiveSeed masks with 0x7FFFFFFF and maps 0 -> 1.
+FNVA_OFFSET = 2166136261
+FNVA_PRIME = 16777619
+
+MONSTER_DEN_DOMAIN = "monster_den_select"
+STAIR_SELECT_DOMAIN = "stair_select"
+SPAWN_REGION_DUNGEON = 1  # SpawnRegion.Dungeon
+
+
+def create_seed(global_seed: int, spawn_region: int, floor: int,
+                stable_room_key: int, spawn_domain: str) -> int:
+    h = FNVA_OFFSET
+
     def add_byte(b: int) -> None:
         nonlocal h
         h ^= b & 0xFF
-        h = (h * 16777619) & 0xFFFFFFFF
+        h = (h * FNVA_PRIME) & 0xFFFFFFFF
+
     def add_int(v: int) -> None:
         v &= 0xFFFFFFFF
         add_byte(v)
         add_byte(v >> 8)
         add_byte(v >> 16)
         add_byte(v >> 24)
-    add_int(seed)
-    add_int(region)
+
+    def add_long(v: int) -> None:
+        # C#: AddInt((int)value); AddInt((int)(value >> 32));
+        add_int(v & 0xFFFFFFFF)
+        add_int((v >> 32) & 0xFFFFFFFF)
+
+    def add_string(sv: str) -> None:
+        if not sv:
+            add_int(0)
+            return
+        add_int(len(sv))
+        for ch in sv:
+            add_int(ord(ch))
+
+    add_long(global_seed)
+    add_int(spawn_region)
     add_int(floor)
-    add_int(0)
-    for ch in domain:
-        code = ord(ch)
-        add_byte(code & 0xFF)
-        add_byte((code >> 8) & 0xFF)
-    return int32(h)
+    add_int(stable_room_key)
+    add_string(spawn_domain)
+
+    seed = h & 0x7FFFFFFF
+    return 1 if seed == 0 else seed
 
 
 def unity_build_settings_seed_from_text(text: str) -> int:
@@ -179,7 +214,13 @@ class DungeonSettings:
     extra_center_distance_penalty_divisor: int = 10
     monster_den_chance: float = 0.05
     max_monster_den_count: int = 1
-    seed: Optional[int] = None
+    seed: Optional[int] = None          # folded int (geometry): matches Unity DungeonSettings.Seed / DeriveSeed
+    raw_seed: Optional[int] = None      # raw long inspector seed: matches DungeonManager.seed fed into CreateSeed
+    spawn_region: int = SPAWN_REGION_DUNGEON  # matches DungeonManager.currentStageRegion (Dungeon = 1)
+    # Unity DungeonManager.stairAvoidTypes. Spawn/Elite are ALWAYS excluded regardless.
+    # The scene currently serializes an empty array, so the default here avoids nothing extra.
+    # Flip to True to mirror a Unity inspector that adds RoomType.MonsterDen to stairAvoidTypes.
+    stair_avoid_monster_den: bool = False
     floor: int = 1
     max_floor: int = 100
     min_straight: int = 2
@@ -229,6 +270,7 @@ class Room:
     cy: int
     is_elite: bool = False
     is_monster_den: bool = False
+    is_spawn: bool = False
 
 
 @dataclass
@@ -296,6 +338,11 @@ class DungeonGenerator:
         self.nodes: List[BSPNode] = []
         self.elite_room_index = -1
         self.stair_room_index = -1
+        self.spawn_room_index = -1
+        self.spawn_pos: Optional[Tuple[int, int]] = None
+        # CreateSeed consumes the RAW long inspector seed, independent of the folded
+        # geometry seed. None (random-seed mode) falls back to 0 like Unity's default field.
+        self.raw_seed = self.s.raw_seed if self.s.raw_seed is not None else 0
 
     def snapshot(
         self,
@@ -305,7 +352,7 @@ class DungeonGenerator:
         extra_paths: Optional[List[Tuple[List[Tuple[int, int]], str, str]]] = None,
     ) -> None:
         copied_grid = [row[:] for row in self.grid]
-        copied_rooms = [Room(r.x, r.y, r.w, r.h, r.cx, r.cy, r.is_elite, r.is_monster_den) for r in self.rooms]
+        copied_rooms = [Room(r.x, r.y, r.w, r.h, r.cx, r.cy, r.is_elite, r.is_monster_den, r.is_spawn) for r in self.rooms]
         copied_extra_paths = None
         if extra_paths:
             copied_extra_paths = [(list(candidate_path), color, label) for candidate_path, color, label in extra_paths]
@@ -361,8 +408,11 @@ class DungeonGenerator:
             self.fill_room(room)
             self.snapshot(f"03-{i+1:02d}. 방 바닥 채우기 R{i}")
         self.connect_all()
-        self.place_stairs()
+        # New pipeline (matches DungeonManager.RunGenerationPipeline): all room labels are
+        # resolved BEFORE stairs. Spawn -> MonsterDen -> (elite key plan, N/A here) -> Stair last.
+        self.compute_spawn_pos()
         self.assign_monster_dens()
+        self.place_stairs()
         self.snapshot("99. 최종 던전")
         return self.steps
 
@@ -1412,17 +1462,17 @@ class DungeonGenerator:
         if self.s.max_monster_den_count <= 0 or self.s.monster_den_chance <= 0.0:
             self.snapshot("07. MonsterDen 지정 생략", note="MaxMonsterDenCount <= 0 or MonsterDenChance <= 0")
             return
+        # Mirrors RoomRegistry.AssignMonsterDens: Normal rooms only, excluding the spawn
+        # room and elite rooms. Stairs do NOT exist yet at this stage, so they are not excluded.
         candidates = []
         for i, room in enumerate(self.rooms):
-            if i == 0:
-                continue
-            if i == self.stair_room_index:
+            if i == self.spawn_room_index:
                 continue
             if room.is_elite:
                 continue
             candidates.append(i)
         if not candidates:
-            self.snapshot("07. MonsterDen 후보 없음", note="No Normal room candidates after excluding Spawn/Stair/Elite.")
+            self.snapshot("07. MonsterDen 후보 없음", note="No Normal room candidates after excluding Spawn/Elite.")
             return
         rng = DotNetRandom(self.create_monster_den_seed())
         selected = []
@@ -1457,27 +1507,112 @@ class DungeonGenerator:
             )
 
     def create_monster_den_seed(self) -> int:
-        # DeterministicSeedUtility style stable hash input for the simulator.
-        # The Unity domain string is monster_den_select. Region is not exposed in this viewer.
-        seed = self.s.seed if self.s.seed is not None else 0
-        return fnv1a_32_ints_and_string(seed, self.s.floor, 0, "monster_den_select") & 0x7FFFFFFF
+        # Byte-identical to DeterministicSeedUtility.CreateSeed(seed, region, floor, 0, MonsterDenDomain).
+        return create_seed(self.raw_seed, self.s.spawn_region, self.s.floor, 0, MONSTER_DEN_DOMAIN)
+
+    def compute_spawn_pos(self) -> None:
+        # Mirrors SpawnPositionService.ComputeSpawnPos: the ROOM tile with the smallest
+        # Manhattan distance to the map center. Scan order (row-major, strict '<' update)
+        # matches Unity so ties resolve to the same tile -> same spawn room.
+        for room in self.rooms:
+            room.is_spawn = False
+        self.spawn_room_index = -1
+        self.spawn_pos = None
+        if not self.rooms:
+            self.snapshot("06. 스폰 위치 계산", note="방이 없어 스폰 위치를 계산할 수 없습니다.")
+            return
+
+        mid_x = self.s.map_width // 2
+        mid_y = self.s.map_height // 2
+        best_dist = INT_MAX
+        spawn_col, spawn_row = mid_x, mid_y
+        for row in range(self.s.map_height):
+            for col in range(self.s.map_width):
+                if self.grid[row][col] != ROOM:
+                    continue
+                dist = abs(col - mid_x) + abs(row - mid_y)
+                if dist >= best_dist:
+                    continue
+                best_dist = dist
+                spawn_col, spawn_row = col, row
+
+        self.spawn_pos = (spawn_col, spawn_row)
+        self.spawn_room_index = self.room_index_at(spawn_col, spawn_row)
+        if self.spawn_room_index >= 0:
+            self.rooms[self.spawn_room_index].is_spawn = True
+        self.snapshot(
+            f"06. 스폰 위치 계산 R{self.spawn_room_index}",
+            note=(
+                f"center=({mid_x},{mid_y}) spawnTile=({spawn_col},{spawn_row}) "
+                f"distManhattan={best_dist} spawnRoom=R{self.spawn_room_index}"
+            )
+        )
+
+    def room_index_at(self, x: int, y: int) -> int:
+        for i, r in enumerate(self.rooms):
+            if r.x <= x < r.x + r.w and r.y <= y < r.y + r.h:
+                return i
+        return -1
 
     def place_stairs(self) -> None:
+        # Mirrors DungeonManager.PlaceStairForFloor. Runs LAST, after every room label is
+        # resolved, so spawn/elite/avoid rooms can be skipped. Uses an INDEPENDENT stair RNG
+        # (StairSelectDomain) instead of the layout RNG, so the map layout is invariant and
+        # only the stair position is re-derived deterministically.
+        self.stair_room_index = -1
         if not self.rooms or self.s.floor >= self.s.max_floor:
+            self.snapshot("08. 계단 배치 생략", note="최고층이거나 방이 없어 계단을 배치하지 않습니다.")
             return
-        indices = list(range(len(self.rooms)))
-        for i in range(len(indices) - 1, 0, -1):
-            j = self.rng.next(i + 1)
-            indices[i], indices[j] = indices[j], indices[i]
-        for idx in indices:
-            ok, sx, sy = self.try_find_stair_pos(self.rooms[idx])
-            if ok:
-                self.grid[sy][sx] = STAIR_UP
-                self.stair_room_index = idx
-                self.snapshot(f"06. 계단 배치 R{idx}", note=f"STAIR_UP=({sx}, {sy})")
-                break
 
-    def try_find_stair_pos(self, room: Room):
+        stair_rng = DotNetRandom(self.create_stair_seed())
+        order = list(range(len(self.rooms)))
+        for i in range(len(order) - 1, 0, -1):
+            j = stair_rng.next(i + 1)
+            order[i], order[j] = order[j], order[i]
+
+        # Phase 1: honor exclusions. Phase 2 fallback: ignore them (avoid softlock = no stair).
+        if self.try_select_and_carve_stair(order, stair_rng, True):
+            return
+        if self.try_select_and_carve_stair(order, stair_rng, False):
+            return
+        self.snapshot("08. 계단 배치 실패", note="유효한 방이 없어 계단을 배치하지 못했습니다.")
+
+    def try_select_and_carve_stair(self, order: List[int], rng: 'DotNetRandom',
+                                   apply_exclusions: bool) -> bool:
+        for idx in order:
+            if apply_exclusions and self.is_stair_excluded(idx):
+                continue
+            ok, sx, sy = self.try_find_stair_pos(self.rooms[idx], rng)
+            if not ok:
+                continue
+            self.grid[sy][sx] = STAIR_UP
+            self.stair_room_index = idx
+            self.snapshot(
+                f"08. 계단 배치 R{idx}",
+                note=(
+                    f"STAIR_UP=({sx}, {sy}) exclusionsApplied={apply_exclusions} "
+                    f"stairSeed={self.create_stair_seed()}"
+                )
+            )
+            return True
+        return False
+
+    def is_stair_excluded(self, idx: int) -> bool:
+        # Mirrors DungeonManager.IsStairExcluded: spawn and elite are always excluded;
+        # stairAvoidTypes is configurable (viewer models the MonsterDen case).
+        if idx == self.spawn_room_index:
+            return True
+        if self.rooms[idx].is_elite:
+            return True
+        if self.s.stair_avoid_monster_den and self.rooms[idx].is_monster_den:
+            return True
+        return False
+
+    def create_stair_seed(self) -> int:
+        # Byte-identical to DeterministicSeedUtility.CreateSeed(seed, region, floor, 0, StairSelectDomain).
+        return create_seed(self.raw_seed, self.s.spawn_region, self.s.floor, 0, STAIR_SELECT_DOMAIN)
+
+    def try_find_stair_pos(self, room: Room, rng: 'DotNetRandom'):
         candidates: List[Tuple[int, int]] = []
         for row in range(room.y + 1, room.y + room.h - 1):
             for col in range(room.x + 1, room.x + room.w - 1):
@@ -1485,7 +1620,7 @@ class DungeonGenerator:
                     candidates.append((col, row))
         if not candidates:
             return False, -1, -1
-        sx, sy = candidates[self.rng.next(len(candidates))]
+        sx, sy = candidates[rng.next(len(candidates))]
         return True, sx, sy
 
     def is_valid_stair_pos(self, x: int, y: int) -> bool:
@@ -1547,6 +1682,8 @@ class DungeonViewer(tk.Tk):
         self.max_monster_den_count_var = tk.StringVar(value="1")
         self.min_straight_var = tk.StringVar(value="2")
         self.max_floor_var = tk.StringVar(value="100")
+        self.spawn_region_var = tk.StringVar(value=str(SPAWN_REGION_DUNGEON))
+        self.stair_avoid_den_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="")
         self.is_playing = False
         self.play_delay_ms = 180
@@ -1612,6 +1749,9 @@ class DungeonViewer(tk.Tk):
         self._add_labeled_entry(settings_row3, "Max MonsterDen Count", self.max_monster_den_count_var, 4)
         self._add_labeled_entry(settings_row4, "MinStraight", self.min_straight_var, 4)
         self._add_labeled_entry(settings_row4, "MaxFloor", self.max_floor_var, 5)
+        self._add_labeled_entry(settings_row4, "SpawnRegion (Dungeon=1)", self.spawn_region_var, 4)
+        ttk.Checkbutton(settings_row4, text="Stair avoids MonsterDen",
+                        variable=self.stair_avoid_den_var).pack(side=tk.LEFT, padx=(4, 10))
 
         self.canvas = tk.Canvas(self, bg="#1b1d22", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
@@ -1650,6 +1790,8 @@ class DungeonViewer(tk.Tk):
         try:
             seed_text = self.seed_var.get().strip()
             seed = unity_build_settings_seed_from_text(seed_text) if seed_text else None
+            # CreateSeed (monster den / stair) needs the RAW long inspector seed, not the fold.
+            raw_seed = int(seed_text) if seed_text else None
             floor = int(self.floor_var.get().strip())
             settings = DungeonSettings(
                 map_width=int(self.map_w_var.get().strip()),
@@ -1669,6 +1811,9 @@ class DungeonViewer(tk.Tk):
                 min_straight=int(self.min_straight_var.get().strip()),
                 max_floor=int(self.max_floor_var.get().strip()),
                 seed=seed,
+                raw_seed=raw_seed,
+                spawn_region=int(self.spawn_region_var.get().strip()),
+                stair_avoid_monster_den=bool(self.stair_avoid_den_var.get()),
                 floor=floor,
             )
             gen = DungeonGenerator(settings)
@@ -1947,6 +2092,8 @@ class DungeonViewer(tk.Tk):
                     self.draw_rect(ox, oy, r.x, r.y, r.w, r.h, "#ff3b30", max(2, min(4, self.cell // 2)))
                 elif r.is_monster_den:
                     self.draw_rect(ox, oy, r.x, r.y, r.w, r.h, "#c77dff", max(2, min(4, self.cell // 2)))
+                elif r.is_spawn:
+                    self.draw_rect(ox, oy, r.x, r.y, r.w, r.h, "#ffd60a", max(2, min(4, self.cell // 2)))
 
                 label = f"R{i}"
                 fill = "#ffffff"
@@ -1956,6 +2103,9 @@ class DungeonViewer(tk.Tk):
                 elif r.is_monster_den:
                     label += "\nDEN"
                     fill = "#e0b3ff"
+                elif r.is_spawn:
+                    label += "\nSPAWN"
+                    fill = "#ffe680"
                 self.canvas.create_text(ox + r.cx * self.cell + self.cell // 2,
                                         oy + r.cy * self.cell + self.cell // 2,
                                         text=label, fill=fill,
@@ -1964,7 +2114,7 @@ class DungeonViewer(tk.Tk):
 
         legend_x = ox
         legend_y = oy + h * self.cell + 8
-        legend = [("EMPTY", EMPTY), ("ROOM", ROOM), ("CORRIDOR", CORRIDOR), ("STAIR_UP", STAIR_UP), ("ELITE", -3), ("DEN", -4), ("selected path", -1), ("EXTRA candidates", -2)]
+        legend = [("EMPTY", EMPTY), ("ROOM", ROOM), ("CORRIDOR", CORRIDOR), ("STAIR_UP", STAIR_UP), ("SPAWN", -5), ("ELITE", -3), ("DEN", -4), ("selected path", -1), ("EXTRA candidates", -2)]
         lx = legend_x
         for name, tile in legend:
             if tile == -1:
@@ -1975,6 +2125,8 @@ class DungeonViewer(tk.Tk):
                 color = "#ff3b30"
             elif tile == -4:
                 color = "#c77dff"
+            elif tile == -5:
+                color = "#ffd60a"
             else:
                 color = self.COLORS[tile]
             self.canvas.create_rectangle(lx, legend_y, lx + 12, legend_y + 12, outline="", fill=color)
